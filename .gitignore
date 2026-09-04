@@ -259,6 +259,9 @@ temp_audio.mp3
 *.tmp
 *.temp
 
+# Runtime user data (stored next to the exe / in user profile)
+favorites.json
+
 # Log files
 *.log
 

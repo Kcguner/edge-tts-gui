@@ -1,173 +1,93 @@
 # Edge TTS GUI
 
-A simple graphical user interface (GUI) application built with Python and CustomTkinter that allows you to generate Text-to-Speech (TTS) audio using Microsoft Edge's online TTS service (`edge-tts`) and play it back locally using `just_playback`.
+A desktop app that turns text into natural-sounding speech using Microsoft Edge's free online TTS service. Type or load text, pick one of 300+ voices, tweak rate/pitch, listen, and save as MP3.
 
-![Edge TTS GUI Application Screenshot](images/Screenshotdark.png)
-![Edge TTS GUI Application Screenshot](images/Screenshotlight.png)
+![Edge TTS GUI — dark mode](images/Screenshotdark.png)
+![Edge TTS GUI — light mode](images/Screenshotlight.png)
 
 ## Features
 
-*   **Text Input:** Enter text directly into the textbox or load content from `.txt` or `.srt` (subtitle) files.
-*   **Voice Selection:** Fetches and lists available Microsoft Edge TTS voices.
-*   **Voice Search:** Filter the voice list using a search bar.
-*   **Rate & Pitch Control:** Adjust the speed (rate) and pitch of the generated speech using sliders.
-*   **Audio Generation:** Generates MP3 audio from the input text using the selected voice and settings.
-*   **Audio Playback:**
-    *   Play, Pause, Resume, and Stop the generated audio.
-    *   Seek forward/backward using buttons or the progress slider.
-    *   Displays current playback time and total duration.
-*   **Save Audio:** Save the generated MP3 audio file to your computer.
-*   **Theme Toggle:** Supports Light and Dark modes (follows system setting initially, can be overridden with a switch).
-*   **Error Handling:** Provides feedback for common issues like missing libraries, network errors, or playback problems.
-*   **Temporary File Management:** Automatically creates and cleans up temporary audio files.
+- **Text input** — type directly, paste from clipboard, or load `.txt` / `.srt` subtitle files (dialogue is extracted automatically)
+- **300+ voices** — full Microsoft Edge voice list with live search, language filter, gender filter, and ★ favorites (saved between sessions)
+- **Scrollable voice list** — mouse-wheel friendly list that handles hundreds of voices (works on Windows, macOS, and Linux)
+- **Rate & pitch controls** — sliders with reset buttons, plus mouse-wheel fine-tuning
+- **Audio playback** — play / pause / resume / stop, ±5s seek buttons, draggable progress bar with time display, volume slider
+- **Save as MP3** — one click, with a smart filename suggested from your text
+- **Character & word counter** — live count with a color warning as you approach the ~10,000 character service limit
+- **Dark / Light mode** — follows your system theme, with a manual override switch
+- **Helpful status bar** — always tells you why a button is disabled (e.g. "Enter text", "Select a valid voice")
 
 ## Requirements
 
-*   **Python:** Version 3.8 or higher recommended.
-*   **pip:** Python package installer (usually comes with Python).
-*   **Network Connection:** Required for `edge-tts` to list voices and generate speech.
-*   **Operating System Specific Dependencies:** `just_playback` relies on system audio libraries. See the installation instructions for your specific OS below.
+- **Python** 3.10 or higher (3.8+ may work, 3.10+ recommended)
+- **pip** (ships with Python)
+- **Internet connection** (required — voices and speech come from the Edge TTS service)
+- **OS audio backend** for `just_playback`:
+  - Windows: works out of the box
+  - Linux (Debian/Ubuntu): `libgstreamer1.0-0 gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav ffmpeg`
+  - Linux (Fedora): `gstreamer1-plugins-{base,good,bad-free,ugly} gstreamer1-plugin-libav ffmpeg`
+  - macOS: `brew install ffmpeg` (recommended)
 
-## Installation
+## Quick start
 
-Follow the steps for your specific operating system.
+```bash
+git clone https://github.com/Ashfield-dev/edge-tts-gui.git
+cd edge-tts-gui
 
-### **Linux (Debian/Ubuntu based)**
+python -m venv venv
+# Windows:
+.\venv\Scripts\activate
+# macOS / Linux:
+source venv/bin/activate
 
-1.  **Install Python & Pip:** If not already installed.
-    ```bash
-    sudo apt update
-    sudo apt install python3 python3-pip python3-venv git -y
-    ```
-2.  **Install GStreamer & FFmpeg:** These are crucial for audio playback with `just_playback`.
-    ```bash
-    sudo apt install libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav ffmpeg -y
-    ```
-3.  **Clone Repository:** Open a terminal and run:
-    ```bash
-    git clone https://github.com/Ashfield-dev/edge-tts-gui.git
-    cd edge-tts-gui
-    ```
-4.  **Create & Activate Virtual Environment:**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-5.  **Install Python Packages:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+pip install -r requirements.txt
+python app.py
+```
 
-### **Linux (Fedora based)**
-
-1.  **Install Python & Pip:** If not already installed. (DNF usually installs pip and venv with python3). Consider enabling RPM Fusion repositories first for FFmpeg if not already done.
-    ```bash
-    sudo dnf install python3 python3-pip git -y
-    ```
-2.  **Install GStreamer & FFmpeg:**
-    ```bash
-    sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly gstreamer1-plugin-libav ffmpeg -y
-    ```
-3.  **Clone Repository:** Open a terminal and run:
-    ```bash
-    git clone https://github.com/Ashfield-dev/edge-tts-gui.git
-    cd edge-tts-gui
-    ```
-4.  **Create & Activate Virtual Environment:**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-5.  **Install Python Packages:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-### **Windows**
-
-1.  **Install Python:** Download and install Python from [python.org](https://www.python.org/). **Make sure to check the box "Add Python X.X to PATH" during installation.** This usually includes `pip` and `venv`.
-2.  **Install Git (Optional but recommended):** Download and install Git from [git-scm.com](https://git-scm.com/). This allows you to use the `git clone` command. Alternatively, download the project ZIP file from the repository page (`https://github.com/Ashfield-dev/edge-tts-gui`) and extract it.
-3.  **Clone or Download Repository:**
-    *   Using Git (Open Command Prompt or PowerShell):
-        ```bash
-        git clone https://github.com/Ashfield-dev/edge-tts-gui.git
-        cd edge-tts-gui
-        ```
-    *   Or download and extract the ZIP, then navigate to the `edge-tts-gui` folder using `cd` in Command Prompt/PowerShell.
-4.  **Create & Activate Virtual Environment:** Open Command Prompt or PowerShell in the project directory:
-    ```bash
-    python -m venv venv
-    .\venv\Scripts\activate
-    ```
-5.  **Install Python Packages:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: `just_playback` usually works out-of-the-box on Windows, but having FFmpeg installed and in your PATH can sometimes help if you encounter specific audio format issues, though it's often not needed initially.)*
-
-### **macOS**
-
-1.  **Install Homebrew (if not installed):** Open Terminal and run:
-    ```bash
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    ```
-    Follow the on-screen instructions (you might need Xcode Command Line Tools).
-2.  **Install Python & Git:**
-    ```bash
-    brew install python git
-    ```
-3.  **Install FFmpeg:** Recommended for broader audio compatibility with `just_playback`.
-    ```bash
-    brew install ffmpeg
-    ```
-4.  **Clone Repository:** Open Terminal and run:
-    ```bash
-    git clone https://github.com/Ashfield-dev/edge-tts-gui.git
-    cd edge-tts-gui
-    ```
-5.  **Create & Activate Virtual Environment:**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-6.  **Install Python Packages:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-## Running the Application
-
-1.  Make sure you are in the `edge-tts-gui` directory in your Terminal or Command Prompt.
-2.  Ensure your virtual environment (`venv`) is activated (you should see `(venv)` at the start of your prompt).
-3.  Run the script:
-    ```bash
-    python app.py
-    ```
+No install needed beyond that — favorites are stored in your user profile (`%APPDATA%\EdgeTTS-GUI` on Windows, `~/.config/EdgeTTS-GUI` on Linux/macOS), so the app folder stays clean.
 
 ## Usage
 
-1.  **Enter Text:** Type or paste text into the main textbox, or click "Load File..." to load from a `.txt` or `.srt` file.
-2.  **Select Voice:** Choose a voice from the dropdown list. You can use the search bar above it to filter voices.
-3.  **Adjust Settings (Optional):** Move the Rate and Pitch sliders to modify the speech output. Use the "Reset" buttons to return them to default.
-4.  **Generate Speech:** Click the "Generate Speech" button. The application will contact the Edge TTS service and create a temporary audio file. The status bar will show progress.
-5.  **Playback:** Once generated ("✅ Audio generated! Press Play."), use the player controls:
-    *   **▶ Play / ⏸ Pause / ▶ Resume:** Toggles playback.
-    *   **⏹ Stop:** Stops playback and resets the position to the beginning.
-    *   **<< / >> Buttons:** Seek backward/forward by a few seconds.
-    *   **Progress Slider:** Drag to seek to a specific position in the audio.
-6.  **Save Audio:** If audio has been generated and playback is stopped, click "Save Audio as MP3" to save the file permanently.
-7.  **Theme:** Use the "Dark Mode" switch to toggle between light and dark themes.
+1. **Enter text** — type, paste (`📋 Paste`), or `Load File...` (`.txt` or `.srt`).
+2. **Pick a voice** — search, filter by language/gender, or tap `☆` to favorite the voices you use most.
+3. **Adjust (optional)** — Rate and Pitch sliders; `Reset` returns to default.
+4. **Generate Speech** — creates a temporary MP3 via the Edge TTS service.
+5. **Listen** — `▶ Play / ⏸ Pause / ⏹ Stop`, seek with the `<< 5s` / `5s >>` buttons or drag the progress bar.
+6. **Save** — `Save Audio as MP3` (enabled once playback is stopped).
+
+## Build a Windows .exe
+
+The `.spec` files are intentionally git-ignored, so build directly from `app.py`:
+
+```powershell
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --windowed --name EdgeTTS-GUI `
+  --hidden-import just_playback --hidden-import _ma_playback `
+  --hidden-import tinytag --hidden-import cffi --hidden-import _cffi_backend `
+  --collect-all customtkinter --collect-all edge_tts --collect-all certifi `
+  app.py
+# -> dist\EdgeTTS-GUI.exe
+```
 
 ## Troubleshooting
 
-*   **"Error: Required library 'just_playback' not found..."**: Ensure `just_playback` is installed (`pip install just_playback` *inside the activated virtual environment*). If it's installed but still fails, double-check that the OS dependencies (GStreamer/FFmpeg) were installed correctly for your system during the setup.
-*   **"Error loading voices..." / "Error generating audio..."**: Check your internet connection, as `edge-tts` requires online access. Sometimes the Edge TTS service might be temporarily unavailable.
-*   **Audio Playback Issues (No sound, errors on Linux/macOS):** Verify that the GStreamer/FFmpeg libraries were installed correctly as per your OS installation steps. Use system tools to confirm audio output is working generally.
-*   **Audio Playback Issues (Windows):** Usually works directly. If issues occur, ensure your system audio drivers are up to date. Installing FFmpeg and adding it to your system PATH *might* help in rare cases, but isn't typically required for `just_playback`.
-*   **PermissionError Deleting Temp File:** This can occasionally happen if the audio player hasn't released the file lock quickly enough. The script tries multiple times, but if it persists, restarting the app usually resolves it.
-*   **`git` command not found:** Ensure Git is installed correctly for your OS and that its location is included in your system's PATH environment variable.
-*   **`python` or `pip` command not found:** Ensure Python is installed correctly and added to your system's PATH (especially important during Windows installation). On Linux/macOS, you might need to use `python3` and `pip3` explicitly if `python` defaults to Python 2.
+| Symptom | Fix |
+|---|---|
+| `'just_playback' not found` | `pip install just_playback` **inside the activated venv** |
+| `Error loading voices` / `Error generating audio` | Check your internet connection; the Edge service is occasionally down |
+| No sound on Linux/macOS | Install the GStreamer/FFmpeg packages listed under Requirements |
+| No sound on Windows | Update audio drivers; installing FFmpeg and adding it to `PATH` helps in rare cases |
+| `PermissionError` deleting temp file | The player sometimes holds the file briefly — restarting the app resolves it |
+| `python`/`pip` not found | Reinstall Python with **"Add Python to PATH"** checked (Windows), or use `python3`/`pip3` |
+
+## Tech stack
+
+Python · [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) · [edge-tts](https://github.com/rany2/edge-tts) · [just_playback](https://github.com/cheofusi/just_playback) · PyInstaller
+
+## Contributing
+
+Issues and pull requests are welcome. Please keep changes small and in the existing code style; if you touch the UI, attach a screenshot in both dark and light mode.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE) for details. Not affiliated with Microsoft; the TTS service belongs to its respective owners.

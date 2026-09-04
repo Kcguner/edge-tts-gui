@@ -1,6 +1,8 @@
 # --- START OF FILE final.py ---
+from __future__ import annotations
 
 # --- Imports ---
+import tkinter as tk
 import customtkinter as ctk
 import asyncio
 import edge_tts
@@ -10,6 +12,8 @@ import os
 import re
 import threading
 import time
+import json
+import sys
 from tkinter import filedialog
 # from mutagen.mp3 import MP3 # Option: Remove if no duration fallback planned
 # from mutagen import MutagenError # Option: Remove if no duration fallback planned
@@ -39,6 +43,39 @@ SEEK_INTERVAL_SECONDS = 5 # Number of seconds to jump forward/backward
 TEXTBOX_PLACEHOLDER_TEXT = "Enter text here or load from a file..."
 # Choose a placeholder color that works reasonably well in both light/dark modes
 TEXTBOX_PLACEHOLDER_COLOR = "#888888" # Medium-Gray
+# Favorites persistence - handles both script and PyInstaller exe.
+# Portable exe dizinine yazmak (Program Files / yetki hatasi) yerine
+# kullanici profilini kullan; eski konumdaki dosyayi tasi.
+def _resolve_favorites_file() -> str:
+    app_name = "EdgeTTS-GUI"
+    candidates: list[str] = []
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(os.path.join(appdata, app_name, "favorites.json"))
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        candidates.append(os.path.join(xdg, app_name, "favorites.json"))
+    if getattr(sys, 'frozen', False):
+        _base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        _base_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    legacy = os.path.join(_base_dir, "favorites.json")
+    candidates.append(legacy)
+    target = candidates[0]
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # Eski konumdan yeni konuma tek seferlik tasma
+        if target != legacy and os.path.exists(legacy) and not os.path.exists(target):
+            try:
+                with open(legacy, 'r', encoding='utf-8') as src, open(target, 'w', encoding='utf-8') as dst:
+                    dst.write(src.read())
+            except OSError:
+                pass
+    except OSError:
+        target = legacy
+    return target
+FAVORITES_FILE = _resolve_favorites_file()
 
 # --- Main Application ---
 class EdgeTTSApp(ctk.CTk):
@@ -75,6 +112,13 @@ class EdgeTTSApp(ctk.CTk):
         # Application State
         self.voices_dict: dict[str, str] = {} # {Display Name: ShortName}
         self._all_voice_display_names: list[str] = []
+        self.voices_raw: list[dict] = []
+        self.voice_display_to_raw: dict[str, dict] = {}
+        self.locale_to_lang_display: dict[str, str] = {}
+        self.lang_display_to_locale: dict[str, str] = {}
+        self.favorite_voices: set[str] = set()  # Set of ShortName
+        self.load_favorites()
+        self.current_volume: float = 1.0
         self.audio_file_path: str | None = None # Path to the temporary audio file
         self.audio_duration: float = 0.0 # Audio duration in seconds
         self._after_id_update_progress: str | None = None # ID for the 'after' job updating progress
@@ -108,7 +152,8 @@ class EdgeTTSApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1) # Textbox row expands
         self.grid_rowconfigure(3, weight=0) # Controls row fixed
-        self.grid_rowconfigure(5, weight=0) # Player row fixed
+        self.grid_rowconfigure(5, weight=0) # Helper row fixed
+        self.grid_rowconfigure(6, weight=0) # Player row fixed
 
         # --- Input Area ---
         input_header_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -126,17 +171,27 @@ class EdgeTTSApp(ctk.CTk):
         )
         self.theme_switch.grid(row=0, column=1, padx=(10, 5), sticky="e")
 
+        self.clear_btn = ctk.CTkButton(input_header_frame, text="🗑 Clear", width=70, height=28, fg_color="gray40", hover_color="gray30", command=self.clear_text)
+        self.clear_btn.grid(row=0, column=2, padx=(0, 5), sticky="e")
+
+        self.paste_btn = ctk.CTkButton(input_header_frame, text="📋 Paste", width=70, height=28, fg_color="gray40", hover_color="gray30", command=self.paste_from_clipboard)
+        self.paste_btn.grid(row=0, column=3, padx=(0, 5), sticky="e")
+
         self.load_file_btn = ctk.CTkButton(input_header_frame, text="Load File...", width=100, command=self.load_text_from_file)
-        self.load_file_btn.grid(row=0, column=2, padx=(0, 5), sticky="e")
+        self.load_file_btn.grid(row=0, column=4, padx=(0, 5), sticky="e")
 
 
         input_frame = ctk.CTkFrame(self)
         input_frame.grid(row=1, column=0, padx=20, pady=5, sticky="nsew")
-        input_frame.grid_rowconfigure(0, weight=1); input_frame.grid_columnconfigure(0, weight=1)
+        input_frame.grid_rowconfigure(0, weight=1); input_frame.grid_rowconfigure(1, weight=0); input_frame.grid_columnconfigure(0, weight=1)
 
         # --- Textbox Setup ---
         self.textbox = ctk.CTkTextbox(input_frame, wrap="word")
-        self.textbox.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self.textbox.grid(row=0, column=0, padx=5, pady=(5, 2), sticky="nsew")
+
+        # Char counter + word count (kritik iyileştirme)
+        self.char_counter_label = ctk.CTkLabel(input_frame, text="0 / 10.000 karakter  •  0 kelime", font=ctk.CTkFont(size=11), text_color="gray60", anchor="e")
+        self.char_counter_label.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="e")
 
         # Bind focus events for placeholder simulation
         self.textbox.bind("<FocusIn>", self._on_textbox_focus_in)
@@ -154,9 +209,54 @@ class EdgeTTSApp(ctk.CTk):
         voice_select_frame = ctk.CTkFrame(controls_frame); voice_select_frame.grid(row=0, column=0, padx=(0, 5), pady=5, sticky="nsew")
         voice_select_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(voice_select_frame, text="Select Voice", font=ctk.CTkFont(size=12)).grid(row=0, column=0, padx=5, pady=(5, 2), sticky="w")
-        self.voice_search_entry = ctk.CTkEntry(voice_select_frame, placeholder_text="Search voice..."); self.voice_search_entry.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="ew")
+        # Filter frame: Language + Gender (kritik iyileştirme)
+        filter_frame = ctk.CTkFrame(voice_select_frame, fg_color="transparent")
+        filter_frame.grid(row=1, column=0, padx=5, pady=(0, 2), sticky="ew")
+        filter_frame.grid_columnconfigure(0, weight=2)
+        filter_frame.grid_columnconfigure(1, weight=1)
+        self.lang_filter_combo = ctk.CTkComboBox(filter_frame, values=["All Languages"], state="disabled", command=self._on_filter_change, width=180)
+        self.lang_filter_combo.set("All Languages")
+        self.lang_filter_combo.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.gender_filter_combo = ctk.CTkComboBox(filter_frame, values=["All", "Male", "Female"], state="disabled", command=self._on_filter_change, width=80)
+        self.gender_filter_combo.set("All")
+        self.gender_filter_combo.grid(row=0, column=1, sticky="ew")
+        self.voice_search_entry = ctk.CTkEntry(voice_select_frame, placeholder_text="Search voice..."); self.voice_search_entry.grid(row=2, column=0, padx=5, pady=(2, 5), sticky="ew")
         self.voice_search_entry.bind("<KeyRelease>", self._on_voice_search)
-        self.voice_dropdown = ctk.CTkComboBox(voice_select_frame, values=["Loading voices..."], state="disabled", command=self.voice_selected); self.voice_dropdown.grid(row=2, column=0, padx=5, pady=(0, 5), sticky="ew")
+        # FIX: CTkComboBox native tkinter.Menu kullanir; Windows'ta 300+ sesle
+        # mouse-wheel ile kaymaz. Wheel destekli Listbox kullaniyoruz.
+        voice_list_container = ctk.CTkFrame(voice_select_frame, fg_color="transparent")
+        voice_list_container.grid(row=3, column=0, padx=5, pady=(0, 2), sticky="ew")
+        voice_list_container.grid_columnconfigure(0, weight=1)
+        self.voice_listbox = tk.Listbox(
+            voice_list_container,
+            height=6,
+            exportselection=False,
+            activestyle="none",
+            selectmode=tk.SINGLE,
+        )
+        self.voice_listbox.grid(row=0, column=0, sticky="nsew")
+        voice_list_container.grid_rowconfigure(0, weight=1)
+        self.voice_list_scrollbar = ctk.CTkScrollbar(voice_list_container, command=self.voice_listbox.yview)
+        self.voice_list_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.voice_listbox.configure(yscrollcommand=self.voice_list_scrollbar.set)
+        self.voice_listbox.insert(0, "Loading voices...")
+        self.voice_listbox.configure(state="disabled")
+        self.voice_listbox.bind("<<ListboxSelect>>", self.voice_selected)
+        # Mouse-wheel: Windows/macOS (<MouseWheel>) + Linux (<Button-4/5>)
+        self.voice_listbox.bind("<MouseWheel>", self._on_voice_list_wheel)
+        self.voice_listbox.bind("<Button-4>", self._on_voice_list_wheel)
+        self.voice_listbox.bind("<Button-5>", self._on_voice_list_wheel)
+        # Geriye uyumluluk: eski kod voice_dropdown bekler
+        self.voice_dropdown = self.voice_listbox
+        self._apply_listbox_theme()
+        # Favorite controls (kritik iyileştirme)
+        fav_frame = ctk.CTkFrame(voice_select_frame, fg_color="transparent")
+        fav_frame.grid(row=4, column=0, padx=5, pady=(0, 5), sticky="ew")
+        fav_frame.grid_columnconfigure(0, weight=1)
+        self.fav_btn = ctk.CTkButton(fav_frame, text="☆ Favori Ekle", width=110, height=22, fg_color="transparent", border_width=1, text_color=("gray10","gray90"), command=self.toggle_favorite, state="disabled")
+        self.fav_btn.grid(row=0, column=0, padx=(0,5), sticky="ew")
+        self.fav_only_checkbox = ctk.CTkCheckBox(fav_frame, text="Sadece ★", command=self._on_filter_change, font=ctk.CTkFont(size=11), width=90)
+        self.fav_only_checkbox.grid(row=0, column=1, sticky="e")
         adj_frame = ctk.CTkFrame(controls_frame); adj_frame.grid(row=0, column=1, padx=(5, 0), pady=5, sticky="nsew")
         adj_frame.grid_columnconfigure(0, weight=1)
         rate_adj_frame = ctk.CTkFrame(adj_frame); rate_adj_frame.grid(row=0, column=0, padx=5, pady=(5,2), sticky="ew")
@@ -175,11 +275,14 @@ class EdgeTTSApp(ctk.CTk):
         # --- Generate Button ---
         self.generate_btn = ctk.CTkButton(self, text="Generate Speech", command=self.start_generate_speech_thread, height=40, font=ctk.CTkFont(size=14, weight="bold"), state="disabled")
         self.generate_btn.grid(row=4, column=0, padx=20, pady=5, sticky="ew")
+        # Generate helper text (kritik: neden disabled)
+        self.generate_helper_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11), text_color="gray60", anchor="w")
+        self.generate_helper_label.grid(row=5, column=0, padx=20, pady=(0, 2), sticky="ew")
 
         # --- Player Controls ---
         # [Player controls setup remains the same as before]
         self.player_frame = ctk.CTkFrame(self)
-        self.player_frame.grid(row=5, column=0, padx=20, pady=5, sticky="ew")
+        self.player_frame.grid(row=6, column=0, padx=20, pady=5, sticky="ew")
         self.player_frame.grid_columnconfigure(4, weight=1) # Progress slider column expands
         self.rewind_btn = ctk.CTkButton(self.player_frame, text=f"<< {SEEK_INTERVAL_SECONDS}s", width=60, command=lambda: self.seek_relative(-SEEK_INTERVAL_SECONDS), state="disabled")
         self.rewind_btn.grid(row=0, column=0, padx=(10, 5), pady=10)
@@ -197,13 +300,35 @@ class EdgeTTSApp(ctk.CTk):
         self.time_label = ctk.CTkLabel(self.player_frame, text="00:00 / 00:00", width=90, font=ctk.CTkFont(size=10), anchor="e")
         self.time_label.grid(row=0, column=5, padx=(0, 10), pady=10, sticky="e")
 
+        # Volume controls (kritik)
+        volume_frame = ctk.CTkFrame(self.player_frame, fg_color="transparent")
+        volume_frame.grid(row=1, column=0, columnspan=6, padx=5, pady=(0, 8), sticky="ew")
+        volume_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(volume_frame, text="Vol:", font=ctk.CTkFont(size=11)).grid(row=0, column=0, padx=(5,5))
+        self.volume_slider = ctk.CTkSlider(volume_frame, from_=0, to=100, number_of_steps=20, command=self.on_volume_change)
+        self.volume_slider.set(100)
+        self.volume_slider.grid(row=0, column=1, padx=5, sticky="ew")
+        self.volume_label = ctk.CTkLabel(volume_frame, text="100%", width=35, font=ctk.CTkFont(size=10))
+        self.volume_label.grid(row=0, column=2, padx=(0,5))
+
+        # FIX: slider'lar uzerinde mouse-wheel ile ince ayar
+        for _slider, _step in (
+            (self.rate_slider, 5.0),
+            (self.pitch_slider, 2.5),
+            (self.volume_slider, 5.0),
+        ):
+            try:
+                self._bind_wheel_to_slider(_slider, _step)
+            except Exception:
+                pass
+
         # --- Save Button ---
         self.save_btn = ctk.CTkButton(self, text="Save Audio as MP3", command=self.save_audio, height=40, font=ctk.CTkFont(size=14), state="disabled")
-        self.save_btn.grid(row=6, column=0, padx=20, pady=5, sticky="ew")
+        self.save_btn.grid(row=7, column=0, padx=20, pady=5, sticky="ew")
 
         # --- Status Label ---
         self.status_label = ctk.CTkLabel(self, text="Status: Initializing...", height=25, anchor="w")
-        self.status_label.grid(row=7, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.status_label.grid(row=8, column=0, padx=20, pady=(5, 10), sticky="ew")
 
     # --- Textbox Placeholder Logic ---
     def _fetch_default_textbox_color(self):
@@ -241,21 +366,43 @@ class EdgeTTSApp(ctk.CTk):
             self.after(50, self._set_initial_textbox_placeholder) # Retry shortly
             return
 
+        # Handle disabled state for placeholder insertion
+        was_disabled = False
+        try:
+            was_disabled = self.textbox.cget("state") == "disabled"
+            if was_disabled:
+                self.textbox.configure(state="normal")
+        except:
+            pass
         current_text = self.textbox.get("1.0", "end-1c").strip()
         if not current_text:
             self.textbox_placeholder_active = True
             self.textbox.insert("1.0", TEXTBOX_PLACEHOLDER_TEXT)
             self.textbox.configure(text_color=TEXTBOX_PLACEHOLDER_COLOR)
             print("INFO: Initial textbox placeholder set.")
+        self.after(10, self.update_char_counter)
+        if was_disabled:
+            try:
+                self.textbox.configure(state="disabled")
+            except:
+                pass
 
 
     def _on_textbox_focus_in(self, event=None):
         """Handles the textbox gaining focus."""
         if not hasattr(self, 'textbox') or not self.default_textbox_color: return
+        # Don't clear if disabled
+        try:
+            if self.textbox.cget("state") == "disabled":
+                return
+        except:
+            pass
         if self.textbox_placeholder_active:
             self.textbox_placeholder_active = False
             self.textbox.delete("1.0", ctk.END)
             self.textbox.configure(text_color=self.default_textbox_color)
+            self.after(10, self.update_char_counter)
+            self.after(20, self._update_ui_after_text_change)
 
     def _on_textbox_focus_out(self, event=None):
         """Handles the textbox losing focus."""
@@ -268,11 +415,25 @@ class EdgeTTSApp(ctk.CTk):
         if not hasattr(self, 'textbox') or not self.default_textbox_color: return
         # Verify focus is actually lost from textbox (important!)
         if self.focus_get() != self.textbox:
+            was_disabled = False
+            try:
+                was_disabled = self.textbox.cget("state") == "disabled"
+                if was_disabled:
+                    self.textbox.configure(state="normal")
+            except:
+                pass
             current_text = self.textbox.get("1.0", "end-1c").strip()
             if not current_text:
                 self.textbox_placeholder_active = True
                 self.textbox.insert("1.0", TEXTBOX_PLACEHOLDER_TEXT)
                 self.textbox.configure(text_color=TEXTBOX_PLACEHOLDER_COLOR)
+                self.after(10, self.update_char_counter)
+                self.after(20, self._update_ui_after_text_change)
+            if was_disabled:
+                try:
+                    self.textbox.configure(state="disabled")
+                except:
+                    pass
 
     def get_input_text(self) -> str:
         """Gets the text from the textbox, excluding the placeholder."""
@@ -282,6 +443,75 @@ class EdgeTTSApp(ctk.CTk):
             return ""
         else:
             return self.textbox.get("1.0", "end-1c").strip()
+
+    def clear_text(self):
+        """Clears the textbox and resets placeholder/counter."""
+        if not hasattr(self, 'textbox') or not self.textbox.winfo_exists():
+            return
+        # Ensure textbox is writable even if disabled
+        was_disabled = False
+        try:
+            was_disabled = self.textbox.cget("state") == "disabled"
+            if was_disabled:
+                self.textbox.configure(state="normal")
+        except:
+            pass
+        self.textbox.delete("1.0", ctk.END)
+        self.textbox_placeholder_active = False
+        self._check_and_set_placeholder()
+        self.update_char_counter()
+        self._update_ui_after_text_change()
+        self.update_status("Metin temizlendi.")
+        if was_disabled:
+            # Restore will be handled by set_ui_state, but ensure after call
+            self.after(10, lambda: self.set_ui_state(self.check_current_audio_state()))
+
+    def paste_from_clipboard(self):
+        """Pastes clipboard content into textbox."""
+        try:
+            clip_text = self.clipboard_get()
+        except Exception:
+            self.update_status("⚠️ Pano boş veya okunamadı.")
+            return
+        if not clip_text:
+            return
+        was_disabled = False
+        try:
+            was_disabled = self.textbox.cget("state") == "disabled"
+            if was_disabled:
+                self.textbox.configure(state="normal")
+        except:
+            pass
+        # If placeholder active, clear it first
+        if self.textbox_placeholder_active:
+            self.textbox.delete("1.0", ctk.END)
+            self.textbox_placeholder_active = False
+            if self.default_textbox_color:
+                self.textbox.configure(text_color=self.default_textbox_color)
+        self.textbox.insert(ctk.INSERT, clip_text)
+        self.update_char_counter()
+        self._update_ui_after_text_change()
+        self.update_status(f"📋 Panodan {len(clip_text)} karakter yapıştırıldı.")
+        if was_disabled:
+            self.after(10, lambda: self.set_ui_state(self.check_current_audio_state()))
+
+    def update_char_counter(self):
+        """Updates character and word counter label (10k Edge TTS limit)."""
+        if not hasattr(self, 'char_counter_label') or not self.char_counter_label.winfo_exists():
+            return
+        text = self.get_input_text()
+        char_count = len(text)
+        word_count = len(text.split()) if text else 0
+        # Color logic: gray <8k, orange 8k-10k, red >10k
+        if char_count == 0:
+            color = "gray60"
+        elif char_count > 10000:
+            color = "#E53935"  # red
+        elif char_count > 8000:
+            color = "#FB8C00"  # orange
+        else:
+            color = "gray60"
+        self.char_counter_label.configure(text=f"{char_count:,} / 10.000 karakter  •  {word_count:,} kelime".replace(",", "."), text_color=color)
 
     # --- Theme Toggle ---
     def _toggle_theme_override(self):
@@ -307,6 +537,10 @@ class EdgeTTSApp(ctk.CTk):
         print("INFO: Updating textbox colors after theme change...")
         self._fetch_default_textbox_color() # Re-fetch the potentially new default color
         # The fetch function now handles applying placeholder color if active
+        try:
+            self._apply_listbox_theme()
+        except Exception:
+            pass
 
     def _update_theme_switch_state(self):
         """Sets the theme switch state based on the *current effective* appearance mode."""
@@ -341,6 +575,8 @@ class EdgeTTSApp(ctk.CTk):
         """Updates UI state after text changes, maintaining current state context."""
         if not hasattr(self, 'textbox'):
             return
+
+        self.update_char_counter()
 
         current_state = self.check_current_audio_state()
 
@@ -382,14 +618,25 @@ class EdgeTTSApp(ctk.CTk):
         has_input_text = bool(self.get_input_text())
 
         # Add proper voice selection validation
-        selected_voice = self.voice_dropdown.get() if hasattr(self, 'voice_dropdown') else ""
+        if hasattr(self, '_get_selected_voice'):
+            selected_voice = self._get_selected_voice()
+        elif hasattr(self, 'voice_dropdown'):
+            try:
+                selected_voice = self.voice_dropdown.get()
+            except Exception:
+                selected_voice = ""
+        else:
+            selected_voice = ""
         has_valid_voice = (voices_loaded and
                            selected_voice and
                            selected_voice in self.voices_dict and
                            "Loading" not in selected_voice and
-                           "No match" not in selected_voice)
+                           "No match" not in selected_voice and
+                           "No voices" not in selected_voice)
 
-        can_generate = has_valid_voice and has_input_text and state not in ['loading', 'generating', 'playing', 'error_no_audio']
+        # FIX: Edge TTS ~10k karakter limiti - asimda Generate bloklanir
+        can_generate = (has_valid_voice and has_input_text
+                        and state not in ['loading', 'generating', 'playing', 'error_no_audio'])
         can_load_text = state not in ['loading', 'generating', 'playing', 'error_no_audio']
         controls_active = state not in ['loading', 'generating', 'error_no_audio']
         # Theme switch should always be active
@@ -414,6 +661,48 @@ class EdgeTTSApp(ctk.CTk):
         elif state == 'generating': generate_btn_text = "Generating..."
         elif state == 'error_no_audio': generate_btn_text = "Audio Error"
 
+        # Generate helper text (kritik)
+        helper_text = ""
+        helper_color = "gray60"
+        char_count = len(self.get_input_text())
+        if state == 'loading':
+            helper_text = "Sesler yükleniyor, lütfen bekleyin..."
+            helper_color = "gray60"
+        elif state == 'generating':
+            helper_text = "Ses olusturuluyor..."
+            helper_color = "#1E88E5"
+        elif state == 'playing':
+            helper_text = "Oynatiliyor - durdurduktan sonra yeni ses olusturabilirsiniz"
+            helper_color = "gray60"
+        elif state == 'error_no_audio':
+            helper_text = "Ses motoru hatasi"
+            helper_color = "#E53935"
+        elif char_count > 10000:
+            helper_text = f"Metin cok uzun ({char_count:,} / 10.000) - kisaltin".replace(",", ".")
+            helper_color = "#E53935"
+        elif not has_input_text and not has_valid_voice:
+            helper_text = "Metin girin ve ses secin"
+            helper_color = "#FB8C00"
+        elif not has_input_text:
+            helper_text = "Metin girin - karakter sayaci ustte"
+            helper_color = "#FB8C00"
+        elif not voices_loaded:
+            helper_text = "Sesler henuz yuklenmedi"
+            helper_color = "#FB8C00"
+        elif not has_valid_voice:
+            helper_text = "Gecerli bir ses secin (filtreyi temizleyin)"
+            helper_color = "#FB8C00"
+        elif can_generate:
+            # Ready state - show character count and selected voice short
+            helper_text = f"Hazir - {char_count} karakter"
+            helper_color = "#2E7D32"
+            if has_valid_voice:
+                _vname = selected_voice.split(' - ')[0].strip() if ' - ' in selected_voice else selected_voice.split('(')[0].strip()
+                helper_text += f" - {_vname}"
+        elif char_count > 8000:
+            helper_text = f"Dikkat: {char_count} karakter (limit 10.000)"
+            helper_color = "#FB8C00"
+
         play_pause_text = "▶ Play"
         if is_playing: play_pause_text = "⏸ Pause"
         elif is_paused: play_pause_text = "▶ Resume"
@@ -422,15 +711,27 @@ class EdgeTTSApp(ctk.CTk):
         try:
             # Use 'winfo_exists' for safety, especially during init/close
             if hasattr(self, 'theme_switch') and self.theme_switch.winfo_exists(): self.theme_switch.configure(state=theme_switch_state)
-            if hasattr(self, 'voice_dropdown') and self.voice_dropdown.winfo_exists(): self.voice_dropdown.configure(state=voice_ctrl_state)
+            if hasattr(self, 'voice_listbox') and self.voice_listbox.winfo_exists():
+                try:
+                    self.voice_listbox.configure(state=voice_ctrl_state)
+                except Exception:
+                    pass
             if hasattr(self, 'voice_search_entry') and self.voice_search_entry.winfo_exists(): self.voice_search_entry.configure(state=voice_ctrl_state)
+            if hasattr(self, 'lang_filter_combo') and self.lang_filter_combo.winfo_exists(): self.lang_filter_combo.configure(state=voice_ctrl_state)
+            if hasattr(self, 'gender_filter_combo') and self.gender_filter_combo.winfo_exists(): self.gender_filter_combo.configure(state=voice_ctrl_state)
+            if hasattr(self, 'fav_btn') and self.fav_btn.winfo_exists(): self.fav_btn.configure(state=voice_ctrl_state)
+            if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.winfo_exists(): self.fav_only_checkbox.configure(state=voice_ctrl_state)
+            if hasattr(self, 'clear_btn') and self.clear_btn.winfo_exists(): self.clear_btn.configure(state=load_file_btn_state)
+            if hasattr(self, 'paste_btn') and self.paste_btn.winfo_exists(): self.paste_btn.configure(state=load_file_btn_state)
             if hasattr(self, 'rate_slider') and self.rate_slider.winfo_exists(): self.rate_slider.configure(state=adj_ctrl_state)
             if hasattr(self, 'pitch_slider') and self.pitch_slider.winfo_exists(): self.pitch_slider.configure(state=adj_ctrl_state)
+            if hasattr(self, 'volume_slider') and self.volume_slider.winfo_exists(): self.volume_slider.configure(state=adj_ctrl_state)
             if hasattr(self, 'rate_reset_btn') and self.rate_reset_btn.winfo_exists(): self.rate_reset_btn.configure(state=adj_ctrl_state)
             if hasattr(self, 'pitch_reset_btn') and self.pitch_reset_btn.winfo_exists(): self.pitch_reset_btn.configure(state=adj_ctrl_state)
             if hasattr(self, 'textbox') and self.textbox.winfo_exists(): self.textbox.configure(state=textbox_state)
             if hasattr(self, 'load_file_btn') and self.load_file_btn.winfo_exists(): self.load_file_btn.configure(state=load_file_btn_state)
             if hasattr(self, 'generate_btn') and self.generate_btn.winfo_exists(): self.generate_btn.configure(state=generate_btn_state, text=generate_btn_text)
+            if hasattr(self, 'generate_helper_label') and self.generate_helper_label.winfo_exists(): self.generate_helper_label.configure(text=helper_text, text_color=helper_color)
             if hasattr(self, 'save_btn') and self.save_btn.winfo_exists(): self.save_btn.configure(state=save_btn_state)
 
             if hasattr(self, 'play_pause_btn') and self.play_pause_btn.winfo_exists(): self.play_pause_btn.configure(state=play_pause_btn_state, text=play_pause_text)
@@ -438,6 +739,10 @@ class EdgeTTSApp(ctk.CTk):
             if hasattr(self, 'rewind_btn') and self.rewind_btn.winfo_exists(): self.rewind_btn.configure(state=seek_btns_state)
             if hasattr(self, 'forward_btn') and self.forward_btn.winfo_exists(): self.forward_btn.configure(state=seek_btns_state)
             if hasattr(self, 'progress_slider') and self.progress_slider.winfo_exists(): self.progress_slider.configure(state=progress_slider_state)
+            try:
+                self.update_fav_button()
+            except:
+                pass
         except Exception as e:
             # This might happen during shutdown if widgets are destroyed
             if "application has been destroyed" not in str(e):
@@ -463,44 +768,265 @@ class EdgeTTSApp(ctk.CTk):
         if hasattr(self, 'pitch_value_label'):
              self.pitch_value_label.configure(text=f"{int(value):+d}Hz")
 
-    def voice_selected(self, choice: str):
-        """Callback when a voice is selected from the dropdown. Updates the UI state."""
+    def on_volume_change(self, value: float):
+        """Handles volume slider changes."""
+        vol = max(0, min(100, int(float(value))))
+        self.current_volume = vol / 100.0
+        if hasattr(self, 'volume_label') and self.volume_label.winfo_exists():
+            try:
+                self.volume_label.configure(text=f"{vol}%")
+            except:
+                pass
+        if self.just_playback_initialized and self.player:
+            try:
+                self.player.set_volume(self.current_volume)
+            except Exception as e:
+                # Ignore if no file loaded yet - volume will be applied on next load
+                if "no file" not in str(e).lower() and "not initialized" not in str(e).lower():
+                    print(f"WARN: Could not set volume: {e}")
+
+    def _on_voice_list_wheel(self, event=None):
+        """Listbox'ta mouse tekerlegi ile kaydirma (Win/macOS/Linux)."""
+        try:
+            lb = self.voice_listbox
+            if str(lb.cget("state")) == "disabled":
+                return "break"
+            if event is None:
+                return "break"
+            # Linux: Button-4 (yukari) / Button-5 (asagi)
+            if getattr(event, "num", None) == 4:
+                lb.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                lb.yview_scroll(1, "units")
+            else:
+                delta = getattr(event, "delta", 0)
+                # Windows: delta=120 katlari; macOS: kucuk degerler
+                steps = int(-1 * (delta / 120)) if delta else 0
+                if steps == 0 and delta != 0:
+                    steps = -1 if delta > 0 else 1
+                lb.yview_scroll(steps, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _apply_listbox_theme(self):
+        """Listbox renklerini aktif CTk temasina uydur."""
+        if not hasattr(self, 'voice_listbox'):
+            return
+        try:
+            mode = ctk.get_appearance_mode()
+            if mode == "Dark":
+                self.voice_listbox.configure(
+                    bg="#2b2b2b", fg="#dce4ee",
+                    selectbackground="#1f6aa5", selectforeground="white",
+                    highlightbackground="#2b2b2b", highlightcolor="#2b2b2b",
+                )
+            else:
+                self.voice_listbox.configure(
+                    bg="white", fg="black",
+                    selectbackground="#1f6aa5", selectforeground="white",
+                    highlightbackground="white", highlightcolor="white",
+                )
+        except Exception:
+            pass
+
+    def _get_selected_voice(self) -> str:
+        """Listbox'ta secili sesin display adini dondur."""
+        try:
+            if not hasattr(self, 'voice_listbox'):
+                return ""
+            sel = self.voice_listbox.curselection()
+            if not sel:
+                return ""
+            return self.voice_listbox.get(sel[0])
+        except Exception:
+            return ""
+
+    def _set_selected_voice(self, name: str):
+        """Listbox'ta verilen adi sec (yoksa ilk ogen)."""
+        try:
+            lb = self.voice_listbox
+            was_disabled = str(lb.cget("state")) == "disabled"
+            if was_disabled:
+                lb.configure(state="normal")
+            lb.selection_clear(0, tk.END)
+            values = lb.get(0, tk.END)
+            idx = values.index(name) if name in values else (0 if values else None)
+            if idx is not None:
+                lb.selection_set(idx)
+                lb.activate(idx)
+                lb.see(idx)
+            if was_disabled:
+                lb.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _set_voice_list_values(self, values: list, state=None):
+        """Listbox icerigini toptan guncelle."""
+        try:
+            lb = self.voice_listbox
+            lb.configure(state="normal")
+            lb.delete(0, tk.END)
+            for v in values:
+                lb.insert(tk.END, v)
+            if state is not None:
+                lb.configure(state=state)
+        except Exception as e:
+            print(f"WARN: Could not update voice list: {e}")
+
+    def _bind_wheel_to_slider(self, slider, step: float = 1.0):
+        """Slider uzerinde mouse-wheel ile ince ayar."""
+        def _on_wheel(event=None):
+            try:
+                if str(slider.cget("state")) == "disabled":
+                    return "break"
+                direction = 0
+                if event is not None:
+                    if getattr(event, "num", None) == 4:
+                        direction = 1
+                    elif getattr(event, "num", None) == 5:
+                        direction = -1
+                    else:
+                        delta = getattr(event, "delta", 0)
+                        direction = 1 if delta > 0 else (-1 if delta < 0 else 0)
+                if direction:
+                    slider.set(max(slider.cget("from_"), min(slider.cget("to"), slider.get() + direction * step)))
+                return "break"
+            except Exception:
+                return "break"
+        try:
+            slider.bind("<MouseWheel>", _on_wheel)
+            slider.bind("<Button-4>", _on_wheel)
+            slider.bind("<Button-5>", _on_wheel)
+        except Exception:
+            pass
+
+    def voice_selected(self, event=None, choice=None):
+        """Callback when a voice is selected from the list. Updates the UI state."""
+        # Listbox'tan cagrida event gelir, ComboBox uyumlulugu icin choice opsiyonel
+        self.update_fav_button()
         current_state = self.check_current_audio_state()
         self.set_ui_state(current_state)
 
+    def load_favorites(self):
+        """Loads favorite voices from JSON file."""
+        try:
+            if os.path.exists(FAVORITES_FILE):
+                with open(FAVORITES_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.favorite_voices = set(data)
+                        print(f"INFO: Loaded {len(self.favorite_voices)} favorite voices from {FAVORITES_FILE}")
+                    else:
+                        self.favorite_voices = set()
+            else:
+                self.favorite_voices = set()
+        except Exception as e:
+            print(f"WARN: Could not load favorites: {e}")
+            self.favorite_voices = set()
+
+    def save_favorites(self):
+        """Saves favorite voices to JSON file."""
+        try:
+            with open(FAVORITES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(sorted(list(self.favorite_voices)), f, ensure_ascii=False, indent=2)
+            print(f"INFO: Saved {len(self.favorite_voices)} favorites")
+        except Exception as e:
+            print(f"WARN: Could not save favorites: {e}")
+
+    def is_favorite(self, display_name: str) -> bool:
+        """Checks if a display name is favorited."""
+        short = self.voices_dict.get(display_name)
+        return short in self.favorite_voices if short else False
+
+    def toggle_favorite(self):
+        """Toggles favorite status for currently selected voice."""
+        display = self._get_selected_voice()
+        if not display or display in ["Loading voices...", "No match found", "No voices found"]:
+            self.update_status("⚠️ Favori için önce bir ses seçin.")
+            return
+        short = self.voices_dict.get(display)
+        if not short:
+            return
+        if short in self.favorite_voices:
+            self.favorite_voices.remove(short)
+            self.update_status(f"☆ Favoriden cikarildi: {display.split(' - ')[0].strip() if ' - ' in display else display.split('(')[0].strip()}")
+        else:
+            self.favorite_voices.add(short)
+            self.update_status(f"★ Favoriye eklendi: {display.split(' - ')[0].strip() if ' - ' in display else display.split('(')[0].strip()}")
+        self.save_favorites()
+        self.update_fav_button()
+        # Re-apply filter if fav-only is active
+        if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.get() == 1:
+            self._apply_voice_filters()
+
+    def update_fav_button(self):
+        """Updates fav button text based on current selection."""
+        if not hasattr(self, 'fav_btn') or not self.fav_btn.winfo_exists():
+            return
+        display = self._get_selected_voice()
+        if self.is_favorite(display):
+            self.fav_btn.configure(text="★ Favoriden Çıkar", fg_color="#FFD700", text_color="black", hover_color="#E6C200")
+        else:
+            self.fav_btn.configure(text="☆ Favori Ekle", fg_color="transparent", text_color=("gray10","gray90"), hover_color=("gray80","gray20"))
+
     def _filter_voices(self) -> list[str]:
-        """Filters the list of voice display names based on search input."""
-        if not hasattr(self, 'voice_search_entry'): return []
-        search_term = self.voice_search_entry.get().lower()
-        if not search_term: return self._all_voice_display_names # Return all if search is empty
-        # Return names containing the search term (case-insensitive)
-        return [name for name in self._all_voice_display_names if search_term in name.lower()]
+        """Filters the list of voice display names based on search + language + gender."""
+        if not hasattr(self, 'voice_search_entry'):
+            return []
+        search_term = self.voice_search_entry.get().lower().strip() if hasattr(self, 'voice_search_entry') else ""
+        lang_display = self.lang_filter_combo.get() if hasattr(self, 'lang_filter_combo') else "All Languages"
+        gender_filter = self.gender_filter_combo.get() if hasattr(self, 'gender_filter_combo') else "All"
+        filtered = self._all_voice_display_names
+        # Language filter (display name -> locale code)
+        if lang_display != "All Languages":
+            locale_code = self.lang_display_to_locale.get(lang_display, lang_display)
+            filtered = [name for name in filtered if self.voice_display_to_raw.get(name, {}).get("Locale") == locale_code]
+        # Gender filter
+        if gender_filter != "All":
+            filtered = [name for name in filtered if self.voice_display_to_raw.get(name, {}).get("Gender") == gender_filter]
+        # Favorite filter
+        fav_only = False
+        if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.winfo_exists():
+            try:
+                fav_only = self.fav_only_checkbox.get() == 1
+            except:
+                fav_only = False
+        if fav_only:
+            filtered = [name for name in filtered if self.is_favorite(name)]
+        # Search term filter
+        if search_term:
+            filtered = [name for name in filtered if search_term in name.lower()]
+        return filtered
 
-    def _on_voice_search(self, event=None):
-        """Updates the voice dropdown list as the user types in the search box."""
-        if not hasattr(self, 'voice_dropdown'): return
+    def _on_filter_change(self, choice=None):
+        """Called when language or gender filter changes."""
+        self._apply_voice_filters()
+
+    def _apply_voice_filters(self):
+        """Applies current filters and updates dropdown + helper."""
+        if not hasattr(self, 'voice_listbox'):
+            return
         filtered_voices = self._filter_voices()
-        current_selection = self.voice_dropdown.get()
-
+        current_selection = self._get_selected_voice()
+        # Update filter result count in status? Optional
         if not filtered_voices:
-            # If no results, display message and disable dropdown
-            self.voice_dropdown.configure(values=["No match found"], state=ctk.DISABLED)
-            self.voice_dropdown.set("No match found")
-            # Trigger UI update after setting invalid selection
+            self._set_voice_list_values(["No match found"], state=ctk.DISABLED)
+            self._set_selected_voice("No match found")
             current_state = self.check_current_audio_state()
             self.set_ui_state(current_state)
         else:
-            # If results found, update list and enable dropdown
-            self.voice_dropdown.configure(values=filtered_voices, state=ctk.NORMAL)
-            # Try to keep the current selection if it's still in the filtered list
+            self._set_voice_list_values(filtered_voices, state=ctk.NORMAL)
             if current_selection in filtered_voices:
-                self.voice_dropdown.set(current_selection)
-            else: # Otherwise, select the first result
-                self.voice_dropdown.set(filtered_voices[0])
-
-            # Trigger UI update after setting new selection
+                self._set_selected_voice(current_selection)
+            else:
+                self._set_selected_voice(filtered_voices[0])
             current_state = self.check_current_audio_state()
             self.set_ui_state(current_state)
+
+    def _on_voice_search(self, event=None):
+        """Updates the voice dropdown list as the user types in the search box."""
+        self._apply_voice_filters()
 
     # --- Asynchronous Operations & Threading ---
     def load_voices_async(self):
@@ -518,7 +1044,7 @@ class EdgeTTSApp(ctk.CTk):
 
         # Use the dedicated function to get input text, ignoring placeholder
         text = self.get_input_text()
-        selected_voice_display = self.voice_dropdown.get()
+        selected_voice_display = self._get_selected_voice()
 
         # Input validation
         if not text: # Check if actual text is empty
@@ -555,8 +1081,25 @@ class EdgeTTSApp(ctk.CTk):
             voices = await edge_tts.list_voices()
             # Sort by Locale, then ShortName for a structured display
             voices.sort(key=lambda v: (v['Locale'], v['ShortName']))
-            # Create a dictionary for quick lookup {DisplayName: ShortName}
-            self.voices_dict = {f"{v['FriendlyName']} ({v['Locale']}, {v['Gender']})": v['ShortName'] for v in voices}
+            self.voices_raw = voices
+            # Build locale -> LocaleName mapping for clean language filter
+            self.locale_to_lang_display = {}
+            self.lang_display_to_locale = {}
+            for v in voices:
+                loc = v['Locale']
+                loc_name = v.get('LocaleName', loc)
+                if loc not in self.locale_to_lang_display:
+                    self.locale_to_lang_display[loc] = loc_name
+                    self.lang_display_to_locale[loc_name] = loc
+            # Create clean display names (remove Microsoft/Online redundancy)
+            def _clean(v):
+                fname = v['FriendlyName']
+                if fname.startswith("Microsoft "):
+                    fname = fname[len("Microsoft "):]
+                fname = fname.replace(" Online (Natural)", "").replace(" Online", "")
+                return fname
+            self.voices_dict = {_clean(v): v['ShortName'] for v in voices}
+            self.voice_display_to_raw = {_clean(v): v for v in voices}
             self._all_voice_display_names = list(self.voices_dict.keys())
             # Update the UI on the main thread when done
             self.after(0, self._update_voice_dropdown_ui, self._all_voice_display_names)
@@ -566,23 +1109,49 @@ class EdgeTTSApp(ctk.CTk):
             self.after(0, lambda: self.set_ui_state('idle')) # Set to idle if loading fails
 
     def _update_voice_dropdown_ui(self, voice_list: list[str]):
-        """Updates the voice ComboBox on the main thread."""
-        if not hasattr(self, 'voice_dropdown') or not self.voice_dropdown.winfo_exists(): return
+        """Updates the voice Listbox on the main thread."""
+        if not hasattr(self, 'voice_listbox') or not self.voice_listbox.winfo_exists(): return
 
         if voice_list:
-            self.voice_dropdown.configure(values=voice_list)
-            self.voice_dropdown.set(voice_list[0]) # Select the first voice by default
+            self._set_voice_list_values(voice_list, state=ctk.NORMAL)
+            self._set_selected_voice(voice_list[0]) # Select the first voice by default
             if hasattr(self, 'voice_search_entry') and self.voice_search_entry.winfo_exists():
                  self.voice_search_entry.configure(state=ctk.NORMAL)
-            self.update_status("Ready.")
+            # Populate language filter with friendly names (temiz arayuz)
+            if hasattr(self, 'lang_filter_combo') and self.lang_filter_combo.winfo_exists():
+                try:
+                    lang_names = sorted(set(self.locale_to_lang_display.values()))
+                    lang_values = ["All Languages"] + lang_names
+                    self.lang_filter_combo.configure(values=lang_values, state=ctk.NORMAL)
+                    self.lang_filter_combo.set("All Languages")
+                except Exception as e:
+                    print(f"WARN: Could not populate language filter: {e}")
+            if hasattr(self, 'gender_filter_combo') and self.gender_filter_combo.winfo_exists():
+                self.gender_filter_combo.configure(state=ctk.NORMAL)
+            if hasattr(self, 'fav_btn') and self.fav_btn.winfo_exists():
+                self.fav_btn.configure(state=ctk.NORMAL)
+            if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.winfo_exists():
+                self.fav_only_checkbox.configure(state=ctk.NORMAL)
+            self.update_fav_button()
+            # Also apply initial filter to ensure consistency
+            self._apply_voice_filters()
+            self.update_status(f"Ready. {len(voice_list)} voices loaded.")
             # Determine final state based on whether audio is already loaded
             current_state = 'generated' if self.audio_file_path else 'idle'
             self.set_ui_state(current_state)
         else:
             # If the list is empty (error during load)
-            self.voice_dropdown.configure(values=["No voices found"], state=ctk.DISABLED)
+            self._set_voice_list_values(["No voices found"], state=ctk.DISABLED)
             if hasattr(self, 'voice_search_entry') and self.voice_search_entry.winfo_exists():
                 self.voice_search_entry.configure(state=ctk.DISABLED)
+            if hasattr(self, 'lang_filter_combo') and self.lang_filter_combo.winfo_exists():
+                self.lang_filter_combo.configure(state=ctk.DISABLED)
+            if hasattr(self, 'gender_filter_combo') and self.gender_filter_combo.winfo_exists():
+                self.gender_filter_combo.configure(state=ctk.DISABLED)
+            if hasattr(self, 'fav_btn') and self.fav_btn.winfo_exists():
+                self.fav_btn.configure(state=ctk.DISABLED)
+            if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.winfo_exists():
+                self.fav_only_checkbox.configure(state=ctk.DISABLED)
             self.update_status("❌ Error: No voices could be loaded.")
             self.set_ui_state('error_no_voices') # Specific error state
 
@@ -667,6 +1236,11 @@ class EdgeTTSApp(ctk.CTk):
         try:
             self.audio_duration = self.player.duration # Get duration from the player
             print(f"INFO: Audio file loaded. Duration: {self.audio_duration:.2f}s")
+            # Apply current volume
+            try:
+                self.player.set_volume(self.current_volume)
+            except Exception as ve:
+                print(f"WARN: Could not apply volume after load: {ve}")
 
             # Check if the duration is valid
             if self.audio_duration > 0:
@@ -1017,6 +1591,13 @@ class EdgeTTSApp(ctk.CTk):
 
             # Insert content into the textbox
             if hasattr(self, 'textbox') and self.textbox.winfo_exists():
+                 was_disabled = False
+                 try:
+                     was_disabled = self.textbox.cget("state") == "disabled"
+                     if was_disabled:
+                         self.textbox.configure(state="normal")
+                 except:
+                     pass
                  self.textbox_placeholder_active = False # Ensure placeholder is off
                  self.textbox.delete("1.0", ctk.END) # Clear old text
                  if self.default_textbox_color: # Ensure we have a valid color
@@ -1025,6 +1606,13 @@ class EdgeTTSApp(ctk.CTk):
                      self.textbox.insert("1.0", content) # Insert new text
                  # Check immediately if the loaded content was empty, and reset placeholder if so
                  self._check_and_set_placeholder()
+                 self.update_char_counter()
+                 self._update_ui_after_text_change()
+                 if was_disabled:
+                     try:
+                         self.textbox.configure(state="disabled")
+                     except:
+                         pass
             self.update_status(status_msg) # Update status bar
             self.set_ui_state('idle') # Update button states based on new text content
 
