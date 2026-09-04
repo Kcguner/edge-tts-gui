@@ -2,8 +2,18 @@
 
 A desktop app that turns text into natural-sounding speech using Microsoft Edge's free online TTS service. Type or load text, pick one of 300+ voices, tweak rate/pitch, listen, and save as MP3.
 
+> **About this fork** — forked from [Ashfield-dev/edge-tts-gui](https://github.com/Ashfield-dev/edge-tts-gui). What's new on top of the original is listed under [What this fork adds](#what-this-fork-adds).
+
 ![Edge TTS GUI — dark mode](images/Screenshotdark.png)
 ![Edge TTS GUI — light mode](images/Screenshotlight.png)
+
+## What this fork adds
+
+- **Scrollable voice list** — the original dropdown (a native menu) couldn't be scrolled with the mouse wheel and broke down with 300+ voices. Replaced with a wheel-friendly list (Windows, macOS, and Linux) with a scrollbar.
+- **Gender-filter fix** — fixed a bug where the voice list showed *"No match found"* right after loading, because the gender filter's default value never applied.
+- **Mouse-wheel tuning** — Rate, Pitch, and Volume sliders can now be adjusted with the mouse wheel.
+- **Portable favorites** — ★ favorites are stored in your user profile (`%APPDATA%\EdgeTTS-GUI` on Windows, `~/.config/EdgeTTS-GUI` on Linux/macOS) instead of next to the exe, so no admin rights are needed and updating the app never wipes them. Existing local favorites are migrated automatically.
+- **New English README** (this file) and a ready-to-download Windows release (see [Releases](https://github.com/Kcguner/edge-tts-gui/releases)).
 
 ## Features
 

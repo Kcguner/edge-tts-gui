@@ -978,12 +978,12 @@ class EdgeTTSApp(ctk.CTk):
         lang_display = self.lang_filter_combo.get() if hasattr(self, 'lang_filter_combo') else "All Languages"
         gender_filter = self.gender_filter_combo.get() if hasattr(self, 'gender_filter_combo') else "All"
         filtered = self._all_voice_display_names
-        # Language filter (display name -> locale code)
-        if lang_display != "All Languages":
+        # Language filter (display name -> locale code). Unknown/empty value = no filtering.
+        if lang_display != "All Languages" and lang_display in self.lang_display_to_locale:
             locale_code = self.lang_display_to_locale.get(lang_display, lang_display)
             filtered = [name for name in filtered if self.voice_display_to_raw.get(name, {}).get("Locale") == locale_code]
-        # Gender filter
-        if gender_filter != "All":
+        # Gender filter. Only explicit Male/Female filters; anything else = no filtering.
+        if gender_filter in ("Male", "Female"):
             filtered = [name for name in filtered if self.voice_display_to_raw.get(name, {}).get("Gender") == gender_filter]
         # Favorite filter
         fav_only = False
@@ -1128,6 +1128,12 @@ class EdgeTTSApp(ctk.CTk):
                     print(f"WARN: Could not populate language filter: {e}")
             if hasattr(self, 'gender_filter_combo') and self.gender_filter_combo.winfo_exists():
                 self.gender_filter_combo.configure(state=ctk.NORMAL)
+                # FIX: set() on a disabled CTkComboBox is silently ignored, so the
+                # initial "All" never stuck - set it now that it is enabled.
+                try:
+                    self.gender_filter_combo.set("All")
+                except Exception:
+                    pass
             if hasattr(self, 'fav_btn') and self.fav_btn.winfo_exists():
                 self.fav_btn.configure(state=ctk.NORMAL)
             if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.winfo_exists():
