@@ -43,39 +43,458 @@ SEEK_INTERVAL_SECONDS = 5 # Number of seconds to jump forward/backward
 TEXTBOX_PLACEHOLDER_TEXT = "Enter text here or load from a file..."
 # Choose a placeholder color that works reasonably well in both light/dark modes
 TEXTBOX_PLACEHOLDER_COLOR = "#888888" # Medium-Gray
-# Favorites persistence - handles both script and PyInstaller exe.
+# Favorites & settings persistence - handles both script and PyInstaller exe.
 # Portable exe dizinine yazmak (Program Files / yetki hatasi) yerine
 # kullanici profilini kullan; eski konumdaki dosyayi tasi.
-def _resolve_favorites_file() -> str:
-    app_name = "EdgeTTS-GUI"
-    candidates: list[str] = []
+APP_NAME = "EdgeTTS-GUI"
+
+def _resolve_app_data_dir() -> str:
     if os.name == "nt":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            candidates.append(os.path.join(appdata, app_name, "favorites.json"))
-    else:
-        xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-        candidates.append(os.path.join(xdg, app_name, "favorites.json"))
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, APP_NAME)
+    xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return os.path.join(xdg, APP_NAME)
+
+
+def _legacy_base_dir() -> str:
     if getattr(sys, 'frozen', False):
-        _base_dir = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        _base_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-    legacy = os.path.join(_base_dir, "favorites.json")
-    candidates.append(legacy)
-    target = candidates[0]
+        return os.path.dirname(os.path.abspath(sys.executable))
     try:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        # Eski konumdan yeni konuma tek seferlik tasma
-        if target != legacy and os.path.exists(legacy) and not os.path.exists(target):
-            try:
-                with open(legacy, 'r', encoding='utf-8') as src, open(target, 'w', encoding='utf-8') as dst:
-                    dst.write(src.read())
-            except OSError:
-                pass
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def _migrate_legacy_file(filename: str, target: str):
+    legacy = os.path.join(_legacy_base_dir(), filename)
+    if target != legacy and os.path.exists(legacy) and not os.path.exists(target):
+        try:
+            with open(legacy, 'r', encoding='utf-8') as src, open(target, 'w', encoding='utf-8') as dst:
+                dst.write(src.read())
+            print(f"INFO: Migrated legacy {filename} to {target}")
+        except OSError as e:
+            print(f"WARN: Could not migrate {filename}: {e}")
+
+
+def _resolve_data_file(filename: str) -> str:
+    app_dir = _resolve_app_data_dir()
+    target = os.path.join(app_dir, filename)
+    try:
+        os.makedirs(app_dir, exist_ok=True)
+        _migrate_legacy_file(filename, target)
     except OSError:
-        target = legacy
+        target = os.path.join(_legacy_base_dir(), filename)
     return target
+
+
+def _resolve_favorites_file() -> str:
+    return _resolve_data_file("favorites.json")
+
+
+def _atomic_write_json(path: str, data) -> bool:
+    """Atomik JSON yazma: .tmp + os.replace ile yarim dosya birakmaz."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        print(f"WARN: Could not write {path}: {e}")
+        return False
+
+
+def _read_json(path: str, default):
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"WARN: Could not read {path}: {e}")
+    return default
+
+
+def _norm_search(s: str) -> str:
+    """Aksan/duyarliliksiz arama: 'turk' -> 'türkçe' eslesir."""
+    try:
+        import unicodedata
+        t = (s or "").lower().strip()
+        t = unicodedata.normalize("NFKD", t)
+        t = "".join(c for c in t if not unicodedata.combining(c))
+        # Turkce'ye ozel (NFKD sonrasi da kalanlar icin)
+        for a, b in (("ı", "i"), ("ş", "s"), ("ğ", "g"), ("ü", "u"), ("ö", "o"), ("ç", "c")):
+            t = t.replace(a, b)
+        return t
+    except Exception:
+        return (s or "").lower().strip()
+
+
 FAVORITES_FILE = _resolve_favorites_file()
+SETTINGS_FILE = _resolve_data_file("settings.json")
+
+
+class ScrollableDropdown(ctk.CTkFrame):
+    """CTkComboBox yerine: tk.Menu kullanmaz, Listbox+scrollbar+wheel ile 100+ ogede sorunsuz kayar.
+
+    CTkComboBox'in alt menu olarak kullandigi tkinter.Menu, Windows'ta cok sayida
+    ogede ekran disina tasip mouse-wheel ile kaymaz. Bu widget bunun yerine
+    CTkToplevel icinde Listbox + scrollbar acar; wheel her platformda calisir.
+    Alt kumede CTkComboBox ile uyumlu API sunar: get/set/configure(values,state,command).
+    """
+
+    POPUP_MAX_HEIGHT = 300
+
+    def __init__(self, master, values=None, command=None, width: int = 180,
+                 height: int = 28, state: str = "normal",
+                 search_placeholder: str = "Dil ara...", **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self._values: list[str] = list(values) if values else []
+        self._command = command
+        self._state: str = state
+        self._current: str = self._values[0] if self._values else ""
+        self._search_placeholder = search_placeholder
+        self._popup = None
+        self._popup_listbox = None
+        self._popup_search = None
+        self._global_click_binding = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self.display_btn = ctk.CTkButton(
+            self, text=self._display_text(), anchor="w",
+            height=height, width=width, command=self.toggle_popup,
+            state=state,
+        )
+        self.display_btn.grid(row=0, column=0, sticky="ew")
+
+    # -- public API (CTkComboBox subset) --
+    def _display_text(self) -> str:
+        txt = self._current or "—"
+        # Buton genisliginde tasmamasi icin kirp
+        return (txt[:32] + "…") if len(txt) > 33 else (txt + "  ▼")
+
+    def get(self) -> str:
+        return self._current
+
+    def set(self, value: str):
+        self._current = value
+        if hasattr(self, 'display_btn') and self.display_btn.winfo_exists():
+            try:
+                self.display_btn.configure(text=self._display_text())
+            except Exception:
+                pass
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            self._values = list(kwargs.pop("values") or [])
+            if self._current not in self._values and self._values:
+                # Mevcut secim listede yoksa sessizce ilk ogeye gecme;
+                # cagiran taraf set() ile karar verir. Bos ise ilk degeri al.
+                if not self._current:
+                    self.set(self._values[0])
+                else:
+                    try:
+                        self.display_btn.configure(text=self._display_text())
+                    except Exception:
+                        pass
+            if self._popup_listbox is not None and self._popup is not None:
+                try:
+                    self._refresh_popup_list("")
+                except Exception:
+                    pass
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            try:
+                self.display_btn.configure(state=self._state)
+            except Exception:
+                pass
+        if "width" in kwargs:
+            try:
+                self.display_btn.configure(width=kwargs.pop("width"))
+            except Exception:
+                pass
+        if kwargs:
+            try:
+                super().configure(**kwargs)
+            except Exception:
+                pass
+
+    def cget(self, attribute_name: str):
+        if attribute_name == "values":
+            return list(self._values)
+        if attribute_name == "state":
+            return self._state
+        if attribute_name == "command":
+            return self._command
+        return super().cget(attribute_name)
+
+    # -- popup --
+    def toggle_popup(self):
+        if self._state == "disabled":
+            return
+        if self._popup is not None and self._popup.winfo_exists():
+            self.close_popup()
+        else:
+            self.open_popup()
+
+    def open_popup(self):
+        if self._state == "disabled":
+            return
+        try:
+            self.close_popup()
+        except Exception:
+            pass
+        try:
+            toplevel = self.winfo_toplevel()
+            popup = ctk.CTkToplevel(toplevel)
+            popup.withdraw()
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", True)
+            try:
+                popup.transient(toplevel)
+            except Exception:
+                pass
+            self._popup = popup
+
+            search = ctk.CTkEntry(popup, placeholder_text=self._search_placeholder, height=28)
+            search.pack(fill="x", padx=6, pady=(6, 4))
+            search.bind("<KeyRelease>", lambda e: self._refresh_popup_list(search.get()))
+            search.bind("<Escape>", lambda e: self.close_popup())
+            search.bind("<Down>", lambda e: self._focus_listbox())
+            self._popup_search = search
+
+            list_frame = ctk.CTkFrame(popup, fg_color="transparent")
+            list_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+            list_frame.grid_columnconfigure(0, weight=1)
+            list_frame.grid_rowconfigure(0, weight=1)
+
+            lb = tk.Listbox(list_frame, height=10, exportselection=False,
+                            activestyle="none", selectmode=tk.SINGLE)
+            lb.grid(row=0, column=0, sticky="nsew")
+            sb = ctk.CTkScrollbar(list_frame, command=lb.yview)
+            sb.grid(row=0, column=1, sticky="ns")
+            lb.configure(yscrollcommand=sb.set)
+            self._apply_listbox_theme(lb)
+            lb.bind("<<ListboxSelect>>", self._on_popup_select)
+            lb.bind("<Double-Button-1>", lambda e: self.close_popup())
+            lb.bind("<Return>", lambda e: self._choose_highlighted())
+            lb.bind("<Escape>", lambda e: self.close_popup())
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                lb.bind(seq, self._on_popup_wheel)
+                try:
+                    sb.bind(seq, self._on_popup_wheel)
+                except Exception:
+                    pass
+            self._popup_listbox = lb
+
+            self._refresh_popup_list("")
+            # Konum: butonun hemen alti, ekran disina tasmayacak sekilde
+            try:
+                self.update_idletasks()
+                popup.update_idletasks()
+                x = self.display_btn.winfo_rootx()
+                y = self.display_btn.winfo_rooty() + self.display_btn.winfo_height() + 4
+                w = max(self.display_btn.winfo_width(), 200)
+                n = lb.size()
+                h = min(self.POPUP_MAX_HEIGHT, max(120, 34 + n * 22))
+                sw = popup.winfo_screenwidth()
+                sh = popup.winfo_screenheight()
+                if x + w > sw - 8:
+                    x = max(8, sw - w - 8)
+                if y + h > sh - 40:
+                    y = max(8, self.display_btn.winfo_rooty() - h - 4)
+                popup.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                pass
+            popup.deiconify()
+            try:
+                search.focus_set()
+            except Exception:
+                pass
+            # Disari tiklayinca kapat
+            try:
+                self._global_click_binding = toplevel.bind_all(
+                    "<ButtonPress-1>", self._on_global_click, add="+")
+            except Exception:
+                self._global_click_binding = None
+            try:
+                popup.protocol("WM_DELETE_WINDOW", self.close_popup)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"WARN: Could not open language dropdown: {e}")
+            self._popup = None
+
+    def _focus_listbox(self):
+        try:
+            if self._popup_listbox is not None:
+                self._popup_listbox.focus_set()
+                if not self._popup_listbox.curselection() and self._popup_listbox.size() > 0:
+                    self._popup_listbox.selection_set(0)
+        except Exception:
+            pass
+
+    def _choose_highlighted(self):
+        try:
+            sel = self._popup_listbox.curselection()
+            if sel:
+                self._on_popup_select()
+            elif self._popup_listbox.size() > 0:
+                self._popup_listbox.selection_set(0)
+                self._on_popup_select()
+        except Exception:
+            pass
+
+    def _on_global_click(self, event=None):
+        try:
+            if self._popup is None or not self._popup.winfo_exists():
+                return
+            w = event.widget if event is not None else None
+            if w is None:
+                return
+            # Popup ici veya display butonu ise kapatma
+            try:
+                if str(w).startswith(str(self._popup)) or str(w).startswith(str(self.display_btn)):
+                    return
+            except Exception:
+                pass
+            # Ayrica master frame ici tiklamalari da yoksay (buton cocuklari)
+            try:
+                if str(w).startswith(str(self)):
+                    # display_btn disindaki cocuk yok; guvenlik icin popup acikken kapatma
+                    # ama butonun kendisi zaten yukarida elendi
+                    pass
+            except Exception:
+                pass
+            self.close_popup()
+        except Exception:
+            pass
+
+    def _on_popup_wheel(self, event=None):
+        try:
+            lb = self._popup_listbox
+            if lb is None:
+                return "break"
+            if event is None:
+                return "break"
+            if getattr(event, "num", None) == 4:
+                lb.yview_scroll(-2, "units")
+            elif getattr(event, "num", None) == 5:
+                lb.yview_scroll(2, "units")
+            else:
+                delta = getattr(event, "delta", 0)
+                steps = int(-1 * (delta / 120)) if delta else 0
+                if steps == 0 and delta != 0:
+                    steps = -1 if delta > 0 else 1
+                lb.yview_scroll(steps, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _filtered_values(self, term: str) -> list[str]:
+        t = _norm_search(term)
+        if not t:
+            return list(self._values)
+        return [v for v in self._values if t in _norm_search(v)]
+
+    def _refresh_popup_list(self, term: str):
+        lb = self._popup_listbox
+        if lb is None or not lb.winfo_exists():
+            return
+        items = self._filtered_values(term)
+        lb.delete(0, tk.END)
+        for v in items:
+            lb.insert(tk.END, v)
+        if not items:
+            lb.insert(tk.END, "Sonuç yok")
+            lb.configure(state="disabled")
+        else:
+            try:
+                lb.configure(state="normal")
+            except Exception:
+                pass
+            # Mevcut secimi vurgula
+            try:
+                if self._current in items:
+                    idx = items.index(self._current)
+                    lb.selection_set(idx)
+                    lb.activate(idx)
+                    lb.see(idx)
+                else:
+                    lb.selection_set(0)
+                    lb.see(0)
+            except Exception:
+                pass
+
+    def _on_popup_select(self, event=None):
+        try:
+            lb = self._popup_listbox
+            if lb is None or str(lb.cget("state")) == "disabled":
+                return
+            sel = lb.curselection()
+            if not sel:
+                return
+            value = lb.get(sel[0])
+            if value == "Sonuç yok":
+                return
+            self.set(value)
+            cb = self._command
+            # Secim sonrasi kapat (command popup yokken calissin)
+            self.close_popup()
+            if cb is not None:
+                try:
+                    cb(value)
+                except Exception as e:
+                    print(f"WARN: Dropdown command failed: {e}")
+        except Exception:
+            pass
+
+    def close_popup(self):
+        try:
+            if self._global_click_binding is not None:
+                try:
+                    self.winfo_toplevel().unbind_all("<ButtonPress-1>")
+                except Exception:
+                    pass
+                self._global_click_binding = None
+        except Exception:
+            pass
+        self._popup_listbox = None
+        self._popup_search = None
+        try:
+            if self._popup is not None and self._popup.winfo_exists():
+                self._popup.destroy()
+        except Exception:
+            pass
+        self._popup = None
+        try:
+            self.display_btn.focus_set()
+        except Exception:
+            pass
+
+    def _apply_listbox_theme(self, lb=None):
+        try:
+            lb = lb or self._popup_listbox
+            if lb is None:
+                return
+            mode = ctk.get_appearance_mode()
+            if mode == "Dark":
+                lb.configure(bg="#2b2b2b", fg="#dce4ee", selectbackground="#1f6aa5",
+                             selectforeground="white", highlightbackground="#2b2b2b",
+                             highlightcolor="#2b2b2b")
+            else:
+                lb.configure(bg="white", fg="black", selectbackground="#1f6aa5",
+                             selectforeground="white", highlightbackground="white",
+                             highlightcolor="white")
+        except Exception:
+            pass
+
+    def refresh_theme(self):
+        self._apply_listbox_theme()
 
 # --- Main Application ---
 class EdgeTTSApp(ctk.CTk):
@@ -118,23 +537,37 @@ class EdgeTTSApp(ctk.CTk):
         self.lang_display_to_locale: dict[str, str] = {}
         self.favorite_voices: set[str] = set()  # Set of ShortName
         self.load_favorites()
-        self.current_volume: float = 1.0
+        self.app_settings: dict = _read_json(SETTINGS_FILE, {}) if 'SETTINGS_FILE' in globals() else {}
+        self.current_volume: float = float(self.app_settings.get("volume", 1.0)) if isinstance(self.app_settings.get("volume", 1.0), (int, float)) else 1.0
+        self.current_volume = max(0.0, min(1.0, self.current_volume))
+        # Kaydedilmis tema varsa acilista uygula (System varsayilan)
+        try:
+            _saved_theme = self.app_settings.get("theme")
+            if _saved_theme in ("Light", "Dark"):
+                ctk.set_appearance_mode(_saved_theme)
+                print(f"INFO: Restored appearance mode from settings: '{_saved_theme}'")
+        except Exception:
+            pass
         self.audio_file_path: str | None = None # Path to the temporary audio file
         self.audio_duration: float = 0.0 # Audio duration in seconds
         self._after_id_update_progress: str | None = None # ID for the 'after' job updating progress
         self._slider_being_dragged: bool = False # Flag if user is dragging the progress slider
+        self._settings_after_id: str | None = None
+        self._search_after_id: str | None = None
+        self._pending_voice_shortname: str | None = self.app_settings.get("selected_voice")
 
         # Placeholder state
         self.textbox_placeholder_active = False
         self.default_textbox_color = None # Will be fetched after widget creation
 
         self._build_ui() # Build the UI
+        self._apply_initial_settings_to_widgets()
 
         # Initial Actions
         self.after(10, self._fetch_default_textbox_color) # Schedule fetching color early
         self.after(20, self._set_initial_textbox_placeholder) # Set initial placeholder state after color fetch attempt
 
-        self.update_rate_label(0); self.update_pitch_label(0) # Set initial slider labels
+        # Slider etiketleri _apply_initial_settings_to_widgets icinde ayarlandi
         if self.just_playback_initialized:
              self.update_status("Loading voices..."); self.load_voices_async()
         else:
@@ -210,11 +643,14 @@ class EdgeTTSApp(ctk.CTk):
         voice_select_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(voice_select_frame, text="Select Voice", font=ctk.CTkFont(size=12)).grid(row=0, column=0, padx=5, pady=(5, 2), sticky="w")
         # Filter frame: Language + Gender (kritik iyileştirme)
+        # NOT: Dil filtresi icin CTkComboBox KULLANMIYORUZ. CTkComboBox altta
+        # tkinter.Menu acar; 100+ dilde Windows'ta ekran disina tasip wheel
+        # ile kaymaz. ScrollableDropdown Listbox+scrollbar+wheel kullanir.
         filter_frame = ctk.CTkFrame(voice_select_frame, fg_color="transparent")
         filter_frame.grid(row=1, column=0, padx=5, pady=(0, 2), sticky="ew")
         filter_frame.grid_columnconfigure(0, weight=2)
         filter_frame.grid_columnconfigure(1, weight=1)
-        self.lang_filter_combo = ctk.CTkComboBox(filter_frame, values=["All Languages"], state="disabled", command=self._on_filter_change, width=180)
+        self.lang_filter_combo = ScrollableDropdown(filter_frame, values=["All Languages"], state="disabled", command=self._on_filter_change, width=180)
         self.lang_filter_combo.set("All Languages")
         self.lang_filter_combo.grid(row=0, column=0, padx=(0, 5), sticky="ew")
         self.gender_filter_combo = ctk.CTkComboBox(filter_frame, values=["All", "Male", "Female"], state="disabled", command=self._on_filter_change, width=80)
@@ -243,9 +679,16 @@ class EdgeTTSApp(ctk.CTk):
         self.voice_listbox.configure(state="disabled")
         self.voice_listbox.bind("<<ListboxSelect>>", self.voice_selected)
         # Mouse-wheel: Windows/macOS (<MouseWheel>) + Linux (<Button-4/5>)
+        # Listbox uzerinde + scrollbar uzerinde (kullanici scrollbar'a gelip
+        # cevirdiginde de liste kaysin diye ikisine de bagla).
         self.voice_listbox.bind("<MouseWheel>", self._on_voice_list_wheel)
         self.voice_listbox.bind("<Button-4>", self._on_voice_list_wheel)
         self.voice_listbox.bind("<Button-5>", self._on_voice_list_wheel)
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.voice_list_scrollbar.bind(_seq, self._on_voice_list_wheel)
+            except Exception:
+                pass
         # Geriye uyumluluk: eski kod voice_dropdown bekler
         self.voice_dropdown = self.voice_listbox
         self._apply_listbox_theme()
@@ -525,6 +968,7 @@ class EdgeTTSApp(ctk.CTk):
             # Explicitly set the mode, stopping system following
             ctk.set_appearance_mode(new_mode)
             print(f"INFO: Appearance mode explicitly set to '{new_mode}' (overriding System).")
+            self.schedule_settings_save()
 
             # Update default color after theme change (needs a slight delay)
             if hasattr(self, 'textbox'):
@@ -539,6 +983,11 @@ class EdgeTTSApp(ctk.CTk):
         # The fetch function now handles applying placeholder color if active
         try:
             self._apply_listbox_theme()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'lang_filter_combo') and hasattr(self.lang_filter_combo, 'refresh_theme'):
+                self.lang_filter_combo.refresh_theme()
         except Exception:
             pass
 
@@ -616,6 +1065,10 @@ class EdgeTTSApp(ctk.CTk):
 
         voices_loaded = bool(self.voices_dict)
         has_input_text = bool(self.get_input_text())
+        try:
+            char_count_early = len(self.get_input_text())
+        except Exception:
+            char_count_early = 0
 
         # Add proper voice selection validation
         if hasattr(self, '_get_selected_voice'):
@@ -635,7 +1088,8 @@ class EdgeTTSApp(ctk.CTk):
                            "No voices" not in selected_voice)
 
         # FIX: Edge TTS ~10k karakter limiti - asimda Generate bloklanir
-        can_generate = (has_valid_voice and has_input_text
+        # (Onceki surumde helper kirmizi uyariyordu ama buton aktif kaliyordu.)
+        can_generate = (has_valid_voice and has_input_text and char_count_early <= 10000
                         and state not in ['loading', 'generating', 'playing', 'error_no_audio'])
         can_load_text = state not in ['loading', 'generating', 'playing', 'error_no_audio']
         controls_active = state not in ['loading', 'generating', 'error_no_audio']
@@ -757,16 +1211,20 @@ class EdgeTTSApp(ctk.CTk):
         elif slider_type == "pitch":
             if hasattr(self, 'pitch_slider'): self.pitch_slider.set(0)
             self.update_pitch_label(0)
+        self.schedule_settings_save()
 
     def update_rate_label(self, value: float):
         """Updates the Rate percentage label."""
         if hasattr(self, 'rate_value_label'):
-             self.rate_value_label.configure(text=f"{int(value):+d}%")
+             self.rate_value_label.configure(text=f"{int(float(value)):+d}%")
+        # Slider suruklenirken her adimda disk yazmamak icin debounce'lu kaydet
+        self.schedule_settings_save()
 
     def update_pitch_label(self, value: float):
         """Updates the Pitch Hertz label."""
         if hasattr(self, 'pitch_value_label'):
-             self.pitch_value_label.configure(text=f"{int(value):+d}Hz")
+             self.pitch_value_label.configure(text=f"{int(float(value)):+d}Hz")
+        self.schedule_settings_save()
 
     def on_volume_change(self, value: float):
         """Handles volume slider changes."""
@@ -777,6 +1235,7 @@ class EdgeTTSApp(ctk.CTk):
                 self.volume_label.configure(text=f"{vol}%")
             except:
                 pass
+        self.schedule_settings_save()
         if self.just_playback_initialized and self.player:
             try:
                 self.player.set_volume(self.current_volume)
@@ -827,6 +1286,11 @@ class EdgeTTSApp(ctk.CTk):
                     selectbackground="#1f6aa5", selectforeground="white",
                     highlightbackground="white", highlightcolor="white",
                 )
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'lang_filter_combo') and hasattr(self.lang_filter_combo, 'refresh_theme'):
+                self.lang_filter_combo.refresh_theme()
         except Exception:
             pass
 
@@ -890,7 +1354,18 @@ class EdgeTTSApp(ctk.CTk):
                         delta = getattr(event, "delta", 0)
                         direction = 1 if delta > 0 else (-1 if delta < 0 else 0)
                 if direction:
-                    slider.set(max(slider.cget("from_"), min(slider.cget("to"), slider.get() + direction * step)))
+                    new_val = max(slider.cget("from_"), min(slider.cget("to"), slider.get() + direction * step))
+                    slider.set(new_val)
+                    # CTkSlider.set() command callback'i tetiklemez; etiket + kayit manuel
+                    try:
+                        if slider is getattr(self, 'rate_slider', None):
+                            self.update_rate_label(new_val)
+                        elif slider is getattr(self, 'pitch_slider', None):
+                            self.update_pitch_label(new_val)
+                        elif slider is getattr(self, 'volume_slider', None):
+                            self.on_volume_change(new_val)
+                    except Exception:
+                        pass
                 return "break"
             except Exception:
                 return "break"
@@ -907,18 +1382,15 @@ class EdgeTTSApp(ctk.CTk):
         self.update_fav_button()
         current_state = self.check_current_audio_state()
         self.set_ui_state(current_state)
+        self.schedule_settings_save()
 
     def load_favorites(self):
-        """Loads favorite voices from JSON file."""
+        """Loads favorite voices from JSON file (APPDATA, atomic-safe read)."""
         try:
-            if os.path.exists(FAVORITES_FILE):
-                with open(FAVORITES_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self.favorite_voices = set(data)
-                        print(f"INFO: Loaded {len(self.favorite_voices)} favorite voices from {FAVORITES_FILE}")
-                    else:
-                        self.favorite_voices = set()
+            data = _read_json(FAVORITES_FILE, [])
+            if isinstance(data, list):
+                self.favorite_voices = set(data)
+                print(f"INFO: Loaded {len(self.favorite_voices)} favorite voices from {FAVORITES_FILE}")
             else:
                 self.favorite_voices = set()
         except Exception as e:
@@ -926,13 +1398,213 @@ class EdgeTTSApp(ctk.CTk):
             self.favorite_voices = set()
 
     def save_favorites(self):
-        """Saves favorite voices to JSON file."""
+        """Saves favorite voices to JSON file (atomik yazma)."""
+        ok = _atomic_write_json(FAVORITES_FILE, sorted(list(self.favorite_voices)))
+        if ok:
+            print(f"INFO: Saved {len(self.favorite_voices)} favorites to {FAVORITES_FILE}")
+        else:
+            print(f"WARN: Could not save favorites to {FAVORITES_FILE}")
+
+    # --- Settings persistence (rate/pitch/volume/voice/filters/theme) ---
+    def _collect_settings(self) -> dict:
         try:
-            with open(FAVORITES_FILE, 'w', encoding='utf-8') as f:
-                json.dump(sorted(list(self.favorite_voices)), f, ensure_ascii=False, indent=2)
-            print(f"INFO: Saved {len(self.favorite_voices)} favorites")
+            rate = int(float(self.rate_slider.get())) if hasattr(self, 'rate_slider') else 0
+        except Exception:
+            rate = 0
+        try:
+            pitch = int(float(self.pitch_slider.get())) if hasattr(self, 'pitch_slider') else 0
+        except Exception:
+            pitch = 0
+        vol = getattr(self, 'current_volume', 1.0)
+        try:
+            lang = self.lang_filter_combo.get() if hasattr(self, 'lang_filter_combo') else "All Languages"
+        except Exception:
+            lang = "All Languages"
+        try:
+            gender = self.gender_filter_combo.get() if hasattr(self, 'gender_filter_combo') else "All"
+        except Exception:
+            gender = "All"
+        try:
+            fav_only = bool(self.fav_only_checkbox.get() == 1) if hasattr(self, 'fav_only_checkbox') else False
+        except Exception:
+            fav_only = False
+        try:
+            sel_display = self._get_selected_voice()
+            sel_short = self.voices_dict.get(sel_display)
+        except Exception:
+            sel_short = None
+        try:
+            theme = ctk.get_appearance_mode()
+        except Exception:
+            theme = "System"
+        return {
+            "rate": max(-100, min(100, rate)),
+            "pitch": max(-50, min(50, pitch)),
+            "volume": max(0.0, min(1.0, float(vol))),
+            "lang_filter": lang,
+            "gender_filter": gender if gender in ("All", "Male", "Female") else "All",
+            "fav_only": fav_only,
+            "selected_voice": sel_short,
+            "theme": theme if theme in ("Light", "Dark") else "System",
+        }
+
+    def save_settings(self):
+        try:
+            data = self._collect_settings()
+            self.app_settings = data
+            if _atomic_write_json(SETTINGS_FILE, data):
+                print(f"INFO: Saved settings to {SETTINGS_FILE}: rate={data['rate']} pitch={data['pitch']} vol={data['volume']:.2f}")
         except Exception as e:
-            print(f"WARN: Could not save favorites: {e}")
+            print(f"WARN: Could not save settings: {e}")
+
+    def schedule_settings_save(self, delay_ms: int = 400):
+        """Slider/filter degisikliklerinde disk yazmayi debounce'la."""
+        try:
+            if getattr(self, '_settings_after_id', None):
+                try:
+                    self.after_cancel(self._settings_after_id)
+                except Exception:
+                    pass
+                self._settings_after_id = None
+            if self.winfo_exists():
+                self._settings_after_id = self.after(delay_ms, self._flush_settings_save)
+        except Exception:
+            pass
+
+    def _flush_settings_save(self):
+        self._settings_after_id = None
+        try:
+            if self.winfo_exists():
+                self.save_settings()
+        except Exception:
+            pass
+
+    def _apply_initial_settings_to_widgets(self):
+        """Acilista kaydedilmis rate/pitch/volume degerlerini slider'lara uygula."""
+        s = getattr(self, 'app_settings', {}) or {}
+        try:
+            rate = int(s.get("rate", 0))
+            rate = max(-100, min(100, rate))
+        except Exception:
+            rate = 0
+        try:
+            pitch = int(s.get("pitch", 0))
+            pitch = max(-50, min(50, pitch))
+        except Exception:
+            pitch = 0
+        try:
+            vol_pct = int(round(float(s.get("volume", 1.0)) * 100))
+            vol_pct = max(0, min(100, vol_pct))
+        except Exception:
+            vol_pct = 100
+        try:
+            if hasattr(self, 'rate_slider'):
+                self.rate_slider.set(rate)
+            self.update_rate_label(rate)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'pitch_slider'):
+                self.pitch_slider.set(pitch)
+            self.update_pitch_label(pitch)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'volume_slider'):
+                self.volume_slider.set(vol_pct)
+            # on_volume_change zaten current_volume + label gunceller
+            self.on_volume_change(vol_pct)
+        except Exception:
+            pass
+        # schedule_settings_save'in tetikledigi gereksiz yazmayi iptal et
+        try:
+            if getattr(self, '_settings_after_id', None):
+                try:
+                    self.after_cancel(self._settings_after_id)
+                except Exception:
+                    pass
+                self._settings_after_id = None
+        except Exception:
+            pass
+        print(f"INFO: Restored settings: rate={rate} pitch={pitch} volume={vol_pct}%")
+
+    def _apply_voice_related_settings(self):
+        """Ses listesi yuklendikten sonra dil/cinsiyet/fav/secili sesi geri yukle."""
+        s = getattr(self, 'app_settings', {}) or {}
+        # Gender
+        try:
+            g = s.get("gender_filter", "All")
+            if g in ("All", "Male", "Female") and hasattr(self, 'gender_filter_combo'):
+                self.gender_filter_combo.set(g)
+        except Exception:
+            pass
+        # Fav-only
+        try:
+            if s.get("fav_only") and hasattr(self, 'fav_only_checkbox'):
+                self.fav_only_checkbox.select()
+            elif hasattr(self, 'fav_only_checkbox'):
+                self.fav_only_checkbox.deselect()
+        except Exception:
+            pass
+        # Language (deger listede yoksa All Languages'e dus)
+        try:
+            lang = s.get("lang_filter", "All Languages")
+            if hasattr(self, 'lang_filter_combo'):
+                vals = []
+                try:
+                    vals = self.lang_filter_combo.cget("values")
+                except Exception:
+                    vals = []
+                self.lang_filter_combo.set(lang if lang in vals else "All Languages")
+        except Exception:
+            pass
+        # Filtreleri uygula, sonra kayitli sesi sec
+        try:
+            self._apply_voice_filters()
+        except Exception:
+            pass
+        pending = getattr(self, '_pending_voice_shortname', None)
+        if pending:
+            try:
+                target_display = None
+                for disp, short in self.voices_dict.items():
+                    if short == pending:
+                        target_display = disp
+                        break
+                if target_display is not None:
+                    # Filtre disi kaldiysa filtreleri gevsetmeden secilemez;
+                    # once filtreye uyan listede var mi kontrol et
+                    current_vals = list(self.voice_listbox.get(0, tk.END))
+                    if target_display not in current_vals:
+                        # Kayitli sesi gostermek icin filtreleri sifirla
+                        try:
+                            self.lang_filter_combo.set("All Languages")
+                        except Exception:
+                            pass
+                        try:
+                            self.gender_filter_combo.set("All")
+                        except Exception:
+                            pass
+                        try:
+                            self.voice_search_entry.delete(0, tk.END)
+                        except Exception:
+                            pass
+                        try:
+                            self.fav_only_checkbox.deselect()
+                        except Exception:
+                            pass
+                        self._apply_voice_filters()
+                    self._set_selected_voice(target_display)
+                    try:
+                        self.update_fav_button()
+                        self.set_ui_state(self.check_current_audio_state())
+                    except Exception:
+                        pass
+                    print(f"INFO: Restored selected voice: {target_display}")
+            except Exception as e:
+                print(f"WARN: Could not restore selected voice: {e}")
+            finally:
+                self._pending_voice_shortname = None
 
     def is_favorite(self, display_name: str) -> bool:
         """Checks if a display name is favorited."""
@@ -974,7 +1646,11 @@ class EdgeTTSApp(ctk.CTk):
         """Filters the list of voice display names based on search + language + gender."""
         if not hasattr(self, 'voice_search_entry'):
             return []
-        search_term = self.voice_search_entry.get().lower().strip() if hasattr(self, 'voice_search_entry') else ""
+        try:
+            raw_term = self.voice_search_entry.get() if hasattr(self, 'voice_search_entry') else ""
+        except Exception:
+            raw_term = ""
+        search_term = _norm_search(raw_term)
         lang_display = self.lang_filter_combo.get() if hasattr(self, 'lang_filter_combo') else "All Languages"
         gender_filter = self.gender_filter_combo.get() if hasattr(self, 'gender_filter_combo') else "All"
         filtered = self._all_voice_display_names
@@ -994,18 +1670,24 @@ class EdgeTTSApp(ctk.CTk):
                 fav_only = False
         if fav_only:
             filtered = [name for name in filtered if self.is_favorite(name)]
-        # Search term filter
+        # Search term filter (aksansiz: 'turk' -> 'Türk' eslesir)
         if search_term:
-            filtered = [name for name in filtered if search_term in name.lower()]
+            filtered = [name for name in filtered if search_term in _norm_search(name)]
         return filtered
 
     def _on_filter_change(self, choice=None):
         """Called when language or gender filter changes."""
         self._apply_voice_filters()
+        self.schedule_settings_save()
 
     def _apply_voice_filters(self):
         """Applies current filters and updates dropdown + helper."""
         if not hasattr(self, 'voice_listbox'):
+            return
+        try:
+            if not self.voice_listbox.winfo_exists():
+                return
+        except Exception:
             return
         filtered_voices = self._filter_voices()
         current_selection = self._get_selected_voice()
@@ -1025,8 +1707,28 @@ class EdgeTTSApp(ctk.CTk):
             self.set_ui_state(current_state)
 
     def _on_voice_search(self, event=None):
-        """Updates the voice dropdown list as the user types in the search box."""
-        self._apply_voice_filters()
+        """Arama kutusunda her tusa filtreyi yeniden kurmak yerine debounce uygula."""
+        try:
+            if getattr(self, '_search_after_id', None):
+                try:
+                    self.after_cancel(self._search_after_id)
+                except Exception:
+                    pass
+                self._search_after_id = None
+            self._search_after_id = self.after(150, self._flush_voice_search)
+        except Exception:
+            try:
+                self._apply_voice_filters()
+            except Exception:
+                pass
+
+    def _flush_voice_search(self):
+        self._search_after_id = None
+        try:
+            if self.winfo_exists():
+                self._apply_voice_filters()
+        except Exception:
+            pass
 
     # --- Asynchronous Operations & Threading ---
     def load_voices_async(self):
@@ -1118,6 +1820,7 @@ class EdgeTTSApp(ctk.CTk):
             if hasattr(self, 'voice_search_entry') and self.voice_search_entry.winfo_exists():
                  self.voice_search_entry.configure(state=ctk.NORMAL)
             # Populate language filter with friendly names (temiz arayuz)
+            # ScrollableDropdown: values + state ayni configure cagrisi ile
             if hasattr(self, 'lang_filter_combo') and self.lang_filter_combo.winfo_exists():
                 try:
                     lang_names = sorted(set(self.locale_to_lang_display.values()))
@@ -1139,8 +1842,15 @@ class EdgeTTSApp(ctk.CTk):
             if hasattr(self, 'fav_only_checkbox') and self.fav_only_checkbox.winfo_exists():
                 self.fav_only_checkbox.configure(state=ctk.NORMAL)
             self.update_fav_button()
-            # Also apply initial filter to ensure consistency
-            self._apply_voice_filters()
+            # Kayitli dil/cinsiyet/fav/secili sesi geri yukle (yoksa varsayilan filtre)
+            try:
+                self._apply_voice_related_settings()
+            except Exception as e:
+                print(f"WARN: Could not restore voice settings: {e}")
+                try:
+                    self._apply_voice_filters()
+                except Exception:
+                    pass
             self.update_status(f"Ready. {len(voice_list)} voices loaded.")
             # Determine final state based on whether audio is already loaded
             current_state = 'generated' if self.audio_file_path else 'idle'
@@ -1798,6 +2508,39 @@ class EdgeTTSApp(ctk.CTk):
     def on_closing(self):
         """Called when the application window is closed."""
         print("INFO: Closing application...")
+        # Debounce'lu kayitlari iptal edip son durumu hemen yaz
+        # (rate/pitch/favori/secili ses kaybolmasin)
+        try:
+            if getattr(self, '_settings_after_id', None):
+                try:
+                    self.after_cancel(self._settings_after_id)
+                except Exception:
+                    pass
+                self._settings_after_id = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_search_after_id', None):
+                try:
+                    self.after_cancel(self._search_after_id)
+                except Exception:
+                    pass
+                self._search_after_id = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'lang_filter_combo') and hasattr(self.lang_filter_combo, 'close_popup'):
+                self.lang_filter_combo.close_popup()
+        except Exception:
+            pass
+        try:
+            self.save_settings()
+        except Exception as e:
+            print(f"WARN: Could not save settings on close: {e}")
+        try:
+            self.save_favorites()
+        except Exception as e:
+            print(f"WARN: Could not save favorites on close: {e}")
         self._stop_progress_updater() # Stop the UI update loop
 
         # Stop the player if active
