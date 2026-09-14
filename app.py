@@ -15,6 +15,21 @@ import time
 import json
 import sys
 from tkinter import filedialog
+
+# Konsol cp1252/cp1254 (Turkce Windows) iken emoji/Turkce karakterli
+# print'ler UnicodeEncodeError verip Tk callback'lerini patlatmasin.
+for _stream_name in ("stdout", "stderr"):
+    try:
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _stream_name
+try:
+    del _stream
+except NameError:
+    pass
 # from mutagen.mp3 import MP3 # Option: Remove if no duration fallback planned
 # from mutagen import MutagenError # Option: Remove if no duration fallback planned
 try:
@@ -41,6 +56,14 @@ MIN_WINDOW_HEIGHT = 650
 SEEK_INTERVAL_SECONDS = 5 # Number of seconds to jump forward/backward
 # DEFAULT_APPEARANCE_MODE = "Light" # REMOVED - Now starts with "System"
 TEXTBOX_PLACEHOLDER_TEXT = "Enter text here or load from a file..."
+# Acilista ornek olarak gelen, sesleri hemen denemeye yarayan gercek metin.
+# Kullanici ilk kez yazi yazdiginda/yapistirdiginda/dosya yuklediginde
+# otomatik temizlenir (asagidaki _clear_default_sample).
+DEFAULT_SAMPLE_TEXT = (
+    "Hello and welcome to the Edge text to speech demo. "
+    "This short sample helps you try different voices and languages. "
+    "Simply replace this text with your own words whenever you are ready."
+)
 # Choose a placeholder color that works reasonably well in both light/dark modes
 TEXTBOX_PLACEHOLDER_COLOR = "#888888" # Medium-Gray
 # Favorites & settings persistence - handles both script and PyInstaller exe.
@@ -134,6 +157,8 @@ def _norm_search(s: str) -> str:
 
 FAVORITES_FILE = _resolve_favorites_file()
 SETTINGS_FILE = _resolve_data_file("settings.json")
+PROFILES_FILE = _resolve_data_file("profiles.json")
+MAX_VOICE_PROFILES = 4
 
 
 class ScrollableDropdown(ctk.CTkFrame):
@@ -143,6 +168,10 @@ class ScrollableDropdown(ctk.CTkFrame):
     ogede ekran disina tasip mouse-wheel ile kaymaz. Bu widget bunun yerine
     CTkToplevel icinde Listbox + scrollbar acar; wheel her platformda calisir.
     Alt kumede CTkComboBox ile uyumlu API sunar: get/set/configure(values,state,command).
+
+    Odak kurali: popup disari tiklamayla kapanirsa tiklanan yerin odagi calinmaz
+    (yoksa metin kutusuna tiklayip yazmak imkansizlasir). Odak yalnizca popup
+    icindeyken (secim/Escape ile) dugmeye geri verilir.
     """
 
     POPUP_MAX_HEIGHT = 300
@@ -159,7 +188,12 @@ class ScrollableDropdown(ctk.CTkFrame):
         self._popup = None
         self._popup_listbox = None
         self._popup_search = None
-        self._global_click_binding = None
+        # Ana pencereye bagli ButtonPress dinleyicisinin funcid'si.
+        # bind_all KULLANMIYORUZ: tum uygulamaya yayilir ve unbind_all
+        # CTk'nin dahili/gelecekteki global baglantilarini da siler.
+        # toplevel.bind ise yalnizca ana pencere widget'larinda calisir
+        # (popup ayri bir toplevel oldugu icin onun tiklamalari buraya dusmez).
+        self._outside_press_binding = None
 
         self.grid_columnconfigure(0, weight=1)
         self.display_btn = ctk.CTkButton(
@@ -245,7 +279,7 @@ class ScrollableDropdown(ctk.CTkFrame):
         if self._state == "disabled":
             return
         try:
-            self.close_popup()
+            self.close_popup(restore_focus=False)
         except Exception:
             pass
         try:
@@ -264,6 +298,10 @@ class ScrollableDropdown(ctk.CTkFrame):
             search.pack(fill="x", padx=6, pady=(6, 4))
             search.bind("<KeyRelease>", lambda e: self._refresh_popup_list(search.get()))
             search.bind("<Escape>", lambda e: self.close_popup())
+            # Odak arama kutusundayken Enter'a basmak vurgulu/ilki secmeli;
+            # yoksa kullanici yazip Enter'a basinca hicbir sey olmaz.
+            search.bind("<Return>", lambda e: self._choose_highlighted())
+            search.bind("<KP_Enter>", lambda e: self._choose_highlighted())
             search.bind("<Down>", lambda e: self._focus_listbox())
             self._popup_search = search
 
@@ -280,8 +318,13 @@ class ScrollableDropdown(ctk.CTkFrame):
             lb.configure(yscrollcommand=sb.set)
             self._apply_listbox_theme(lb)
             lb.bind("<<ListboxSelect>>", self._on_popup_select)
-            lb.bind("<Double-Button-1>", lambda e: self.close_popup())
+            # Cift tiklama: secimi onayla (sadece kapat degil). Tek tiklama
+            # zaten <<ListboxSelect>> ile secer; cift tiklamanin ikinci
+            # basi ayni satirdaysa secim degismezdi ve popup secimsiz
+            # kapanirdi - bunun yerine vurgulu ogeyi onayla.
+            lb.bind("<Double-Button-1>", lambda e: self._choose_highlighted())
             lb.bind("<Return>", lambda e: self._choose_highlighted())
+            lb.bind("<KP_Enter>", lambda e: self._choose_highlighted())
             lb.bind("<Escape>", lambda e: self.close_popup())
             for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 lb.bind(seq, self._on_popup_wheel)
@@ -315,12 +358,22 @@ class ScrollableDropdown(ctk.CTkFrame):
                 search.focus_set()
             except Exception:
                 pass
-            # Disari tiklayinca kapat
+            # Disari tiklayinca kapat. Ana pencereye bagli dinleyici yalnizca
+            # ana pencere widget'larinda tetiklenir (popup ayri toplevel),
+            # bu yuzden ic/dis ayirt etmeye gerek yoktur; tek istisna
+            # secim dugmesinin kendisidir (ac/kapa isini toggle_popup yapar).
             try:
-                self._global_click_binding = toplevel.bind_all(
-                    "<ButtonPress-1>", self._on_global_click, add="+")
+                top = toplevel
+                if self._outside_press_binding is not None:
+                    try:
+                        top.unbind("<ButtonPress-1>", self._outside_press_binding)
+                    except Exception:
+                        pass
+                    self._outside_press_binding = None
+                self._outside_press_binding = top.bind(
+                    "<ButtonPress-1>", self._on_outside_press, add="+")
             except Exception:
-                self._global_click_binding = None
+                self._outside_press_binding = None
             try:
                 popup.protocol("WM_DELETE_WINDOW", self.close_popup)
             except Exception:
@@ -340,37 +393,43 @@ class ScrollableDropdown(ctk.CTkFrame):
 
     def _choose_highlighted(self):
         try:
-            sel = self._popup_listbox.curselection()
+            lb = self._popup_listbox
+            if lb is None or not lb.winfo_exists():
+                return
+            try:
+                if str(lb.cget("state")) == "disabled":
+                    return
+            except Exception:
+                pass
+            sel = lb.curselection()
             if sel:
                 self._on_popup_select()
-            elif self._popup_listbox.size() > 0:
-                self._popup_listbox.selection_set(0)
+            elif lb.size() > 0:
+                first = lb.get(0)
+                if first == "Sonuç yok":
+                    return
+                lb.selection_set(0)
                 self._on_popup_select()
         except Exception:
             pass
 
-    def _on_global_click(self, event=None):
+    def _on_outside_press(self, event=None):
+        """Ana pencerede popup disina tiklaninca kapatir.
+
+        Tiklanan widget'in odagi calinmaz: tiklama zaten ilgili widget'a
+        (orn. metin kutusu) odagi vermistir, kapatma bunu geri almamalidir.
+        """
         try:
-            if self._popup is None or not self._popup.winfo_exists():
-                return
             w = event.widget if event is not None else None
-            if w is None:
-                return
-            # Popup ici veya display butonu ise kapatma
-            try:
-                if str(w).startswith(str(self._popup)) or str(w).startswith(str(self.display_btn)):
-                    return
-            except Exception:
-                pass
-            # Ayrica master frame ici tiklamalari da yoksay (buton cocuklari)
-            try:
-                if str(w).startswith(str(self)):
-                    # display_btn disindaki cocuk yok; guvenlik icin popup acikken kapatma
-                    # ama butonun kendisi zaten yukarida elendi
+            if w is not None:
+                try:
+                    btn_path = str(self.display_btn)
+                    # Secim dugmesi (ve ic cocuklari) toggle_popup'a aittir.
+                    if str(w) == btn_path or str(w).startswith(btn_path + "."):
+                        return
+                except Exception:
                     pass
-            except Exception:
-                pass
-            self.close_popup()
+            self.close_popup(restore_focus=False)
         except Exception:
             pass
 
@@ -453,28 +512,56 @@ class ScrollableDropdown(ctk.CTkFrame):
         except Exception:
             pass
 
-    def close_popup(self):
+    def close_popup(self, restore_focus: bool = True):
+        """Popup'i kapatir.
+
+        restore_focus=True iken odak, yalnizca popup icindeyken dugmeye
+        geri verilir. Popup disina tiklanarak kapatmada (restore_focus=False)
+        tiklanan widget'in odagi kesinlikle calinmaz; aksi halde metin
+        kutusuna tiklayip yazmak mumkun olmaz (uygulama "kitlenmis" gibi
+        gorunur).
+        """
+        popup = self._popup
         try:
-            if self._global_click_binding is not None:
+            if self._outside_press_binding is not None:
                 try:
-                    self.winfo_toplevel().unbind_all("<ButtonPress-1>")
+                    self.winfo_toplevel().unbind(
+                        "<ButtonPress-1>", self._outside_press_binding)
                 except Exception:
                     pass
-                self._global_click_binding = None
+                self._outside_press_binding = None
         except Exception:
             pass
         self._popup_listbox = None
         self._popup_search = None
         try:
-            if self._popup is not None and self._popup.winfo_exists():
-                self._popup.destroy()
+            if popup is not None and popup.winfo_exists():
+                popup.destroy()
         except Exception:
             pass
         self._popup = None
-        try:
-            self.display_btn.focus_set()
-        except Exception:
-            pass
+        if restore_focus:
+            take_focus = False
+            try:
+                try:
+                    focused = self.winfo_toplevel().focus_get()
+                except Exception:
+                    focused = None
+                if focused is None:
+                    # Odak bosta kaldi (popup ile yok oldu) -> dugmeye ver
+                    take_focus = True
+                elif popup is not None:
+                    try:
+                        take_focus = str(focused).startswith(str(popup))
+                    except Exception:
+                        take_focus = False
+            except Exception:
+                take_focus = False
+            if take_focus:
+                try:
+                    self.display_btn.focus_set()
+                except Exception:
+                    pass
 
     def _apply_listbox_theme(self, lb=None):
         try:
@@ -537,6 +624,9 @@ class EdgeTTSApp(ctk.CTk):
         self.lang_display_to_locale: dict[str, str] = {}
         self.favorite_voices: set[str] = set()  # Set of ShortName
         self.load_favorites()
+        # Ses profilleri: {"1": {"name":..,"voice":short,"voice_label":..,"rate":..,"pitch":..}, ...}
+        self.voice_profiles: dict[str, dict] = {}
+        self.load_voice_profiles()
         self.app_settings: dict = _read_json(SETTINGS_FILE, {}) if 'SETTINGS_FILE' in globals() else {}
         self.current_volume: float = float(self.app_settings.get("volume", 1.0)) if isinstance(self.app_settings.get("volume", 1.0), (int, float)) else 1.0
         self.current_volume = max(0.0, min(1.0, self.current_volume))
@@ -550,6 +640,10 @@ class EdgeTTSApp(ctk.CTk):
             pass
         self.audio_file_path: str | None = None # Path to the temporary audio file
         self.audio_duration: float = 0.0 # Audio duration in seconds
+        # Uretim suruyor mu? True iken metin kutusu/kontroller ACIK kalir
+        # (uretim baslarken metin/ses/hiz snapshot alinir), yalnizca
+        # Generate dugmesi kilitli kalir. Tum bitis yollari False yapar.
+        self._generating: bool = False
         self._after_id_update_progress: str | None = None # ID for the 'after' job updating progress
         self._slider_being_dragged: bool = False # Flag if user is dragging the progress slider
         self._settings_after_id: str | None = None
@@ -558,6 +652,8 @@ class EdgeTTSApp(ctk.CTk):
 
         # Placeholder state
         self.textbox_placeholder_active = False
+        # Acilis ornek metni ekrandayken True; ilk gercek girdiyle temizlenir
+        self.textbox_default_sample_active = False
         self.default_textbox_color = None # Will be fetched after widget creation
 
         self._build_ui() # Build the UI
@@ -632,6 +728,11 @@ class EdgeTTSApp(ctk.CTk):
 
         # Detect text changes
         self.textbox.bind("<KeyRelease>", self._on_textbox_change)
+        # Acilis ornek metni: ilk gercek karakter girisinde temizlenir
+        # (odaklanma/gezinme tuslari ornegi korur)
+        self.textbox.bind("<KeyPress>", self._on_textbox_sample_key)
+        # Klavye ile yapistirma dugme yolundan gecmez; ornege eklenmesin
+        self.textbox.bind("<<Paste>>", self._on_textbox_paste_sample, add="+")
 
         # --- Controls Area (Voice & Adjustments) ---
         # [Rest of the controls setup remains the same as before]
@@ -714,6 +815,46 @@ class EdgeTTSApp(ctk.CTk):
         self.pitch_slider = ctk.CTkSlider(pitch_adj_frame, from_=-50, to=50, number_of_steps=20, command=self.update_pitch_label); self.pitch_slider.set(0); self.pitch_slider.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         self.pitch_value_label = ctk.CTkLabel(pitch_adj_frame, text="0Hz", width=40, anchor="e"); self.pitch_value_label.grid(row=0, column=2, padx=(0,5), pady=5, sticky="e")
         self.pitch_reset_btn = ctk.CTkButton(pitch_adj_frame, text="Reset", width=50, command=lambda: self.reset_slider("pitch")); self.pitch_reset_btn.grid(row=0, column=3, padx=(0,5), pady=5)
+
+        # --- Ses Profilleri (rate/pitch altindaki bos alan) ---
+        # Her slot: ses adi (shortname) + rate + pitch saklar; yukle dugmesi
+        # uygular, diskette profil adi + detay gosterir.
+        profile_frame = ctk.CTkFrame(adj_frame)
+        profile_frame.grid(row=2, column=0, padx=5, pady=(2, 5), sticky="nsew")
+        profile_frame.grid_columnconfigure(0, weight=1)
+        adj_frame.grid_rowconfigure(2, weight=1)
+        profile_header = ctk.CTkFrame(profile_frame, fg_color="transparent")
+        profile_header.grid(row=0, column=0, padx=5, pady=(5, 2), sticky="ew")
+        profile_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(profile_header, text="📁 Ses Profilleri", font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.profile_clear_all_btn = ctk.CTkButton(profile_header, text="Temizle", width=70, height=22, fg_color="gray40", hover_color="gray30", command=self.clear_all_profiles, state="disabled")
+        self.profile_clear_all_btn.grid(row=0, column=1, sticky="e")
+        ctk.CTkLabel(profile_frame, text="💾: o anki ses+hız+perdeyi kaydet  •  ✕: profili sil",
+                      font=ctk.CTkFont(size=10), text_color="gray60", anchor="w").grid(row=1, column=0, padx=5, pady=(0, 2), sticky="ew")
+        self.profile_load_btns: dict[int, ctk.CTkButton] = {}
+        self.profile_save_btns: dict[int, ctk.CTkButton] = {}
+        self.profile_clear_btns: dict[int, ctk.CTkButton] = {}
+        for _slot in range(1, MAX_VOICE_PROFILES + 1):
+            _row = ctk.CTkFrame(profile_frame, fg_color="transparent")
+            _row.grid(row=_slot + 1, column=0, padx=5, pady=2, sticky="ew")
+            _row.grid_columnconfigure(0, weight=1)
+            _load = ctk.CTkButton(_row, text=f"Boş Profil {_slot}", anchor="w", height=40,
+                                  font=ctk.CTkFont(size=11),
+                                  command=lambda s=_slot: self.load_profile(s), state="disabled")
+            _load.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+            _save = ctk.CTkButton(_row, text="💾", width=38, height=40,
+                                  fg_color="gray40", hover_color="gray30",
+                                  command=lambda s=_slot: self.save_profile(s), state="disabled")
+            _save.grid(row=0, column=1, padx=(0, 5))
+            _clear = ctk.CTkButton(_row, text="✕", width=32, height=40,
+                                   fg_color="transparent", border_width=1,
+                                   text_color=("gray10", "gray90"),
+                                   command=lambda s=_slot: self.clear_profile(s), state="disabled")
+            _clear.grid(row=0, column=2)
+            self.profile_load_btns[_slot] = _load
+            self.profile_save_btns[_slot] = _save
+            self.profile_clear_btns[_slot] = _clear
+        self.refresh_profile_buttons()
 
         # --- Generate Button ---
         self.generate_btn = ctk.CTkButton(self, text="Generate Speech", command=self.start_generate_speech_thread, height=40, font=ctk.CTkFont(size=14, weight="bold"), state="disabled")
@@ -799,7 +940,11 @@ class EdgeTTSApp(ctk.CTk):
 
 
     def _set_initial_textbox_placeholder(self):
-        """Sets the placeholder text and color if the textbox is empty."""
+        """Acilista ornek metni yerlestirir (bossa placeholder degil).
+
+        Ornek metin gercek iceriktir: karakter sayilir, Generate ile
+        hemen seslendirilebilir. Ilk gercek girdide otomatik silinir.
+        """
         if not hasattr(self, 'textbox') or not self.textbox.winfo_exists():
             self.after(50, self._set_initial_textbox_placeholder) # Retry if widget not ready
             return
@@ -810,35 +955,97 @@ class EdgeTTSApp(ctk.CTk):
             return
 
         # Handle disabled state for placeholder insertion
-        was_disabled = False
-        try:
-            was_disabled = self.textbox.cget("state") == "disabled"
-            if was_disabled:
-                self.textbox.configure(state="normal")
-        except:
-            pass
+        # (ic widget kapaliyken insert sessizce basarisiz olur)
+        was_disabled = self._textbox_writable()
         current_text = self.textbox.get("1.0", "end-1c").strip()
         if not current_text:
-            self.textbox_placeholder_active = True
-            self.textbox.insert("1.0", TEXTBOX_PLACEHOLDER_TEXT)
-            self.textbox.configure(text_color=TEXTBOX_PLACEHOLDER_COLOR)
-            print("INFO: Initial textbox placeholder set.")
+            self.textbox_placeholder_active = False
+            self.textbox_default_sample_active = True
+            self.textbox.insert("1.0", DEFAULT_SAMPLE_TEXT)
+            if self.default_textbox_color:
+                self.textbox.configure(text_color=self.default_textbox_color)
+            print("INFO: Initial textbox sample text set.")
         self.after(10, self.update_char_counter)
+        self.after(20, self._update_ui_after_text_change)
+        self._textbox_restore(was_disabled)
+
+    def _clear_default_sample(self):
+        """Acilis ornek metni ekrandaysa sessizce kaldirir."""
+        if getattr(self, 'textbox_default_sample_active', False):
+            try:
+                if hasattr(self, 'textbox') and self.textbox.winfo_exists():
+                    _was = self._textbox_writable()
+                    try:
+                        self.textbox.delete("1.0", ctk.END)
+                    finally:
+                        self._textbox_restore(_was)
+            except Exception:
+                pass
+            self.textbox_default_sample_active = False
+
+    def _on_textbox_paste_sample(self, event=None):
+        """Ctrl+V ile yapistirmada ornek metin uzerine eklenmesin."""
+        self._clear_default_sample()
+        return None # Varsayilan yapistirma davranisi sursun
+
+    def _on_textbox_sample_key(self, event=None):
+        """Ilk gercek karakterde acilis ornegini temizler.
+
+        Tus basilIRKEN calisir (yerlestirmeden once), boylece yazilan
+        karakter bos kutuya duser. Gezinti/kisayol tuslari ornegi korur.
+        """
+        if not getattr(self, 'textbox_default_sample_active', False):
+            return
+        try:
+            ch = getattr(event, 'char', '') or ''
+            state = int(getattr(event, 'state', 0) or 0)
+        except Exception:
+            return
+        # Yazdirilabilir tek karakter + Ctrl/Alt yoksa -> kullanici yaziyor
+        if len(ch) == 1 and ch.isprintable() and not (state & 0xC):
+            self._clear_default_sample()
+
+    def _textbox_writable(self) -> bool:
+        """Programatik duzenleme icin kutuyu yazilabilir yapar.
+
+        CTkTextbox.cget("state") desteklenmedigi icin (ValueError verir)
+        dogrudan ic Text widget'in durumuna bakilir. Kutu kapaliysa
+        gecici acar ve True doner; cagiran is bitince
+        _textbox_restore ile eski haline dondurmelidir.
+        """
+        was_disabled = False
+        try:
+            inner = getattr(getattr(self, 'textbox', None), '_textbox', None)
+            if inner is not None:
+                was_disabled = str(inner.cget("state")) == "disabled"
+        except Exception:
+            was_disabled = False
         if was_disabled:
             try:
-                self.textbox.configure(state="disabled")
-            except:
+                self.textbox.configure(state="normal")
+            except Exception:
+                pass
+        return was_disabled
+
+    def _textbox_restore(self, was_disabled: bool):
+        """_textbox_writable ile acilan kutuyu gerekiyorsa kapatir."""
+        if was_disabled:
+            try:
+                if hasattr(self, 'textbox') and self.textbox.winfo_exists():
+                    self.textbox.configure(state="disabled")
+            except Exception:
                 pass
 
 
     def _on_textbox_focus_in(self, event=None):
         """Handles the textbox gaining focus."""
         if not hasattr(self, 'textbox') or not self.default_textbox_color: return
-        # Don't clear if disabled
+        # Don't clear if disabled (ic widget durumuna bakilir)
         try:
-            if self.textbox.cget("state") == "disabled":
+            _inner = getattr(self.textbox, "_textbox", None)
+            if _inner is not None and str(_inner.cget("state")) == "disabled":
                 return
-        except:
+        except Exception:
             pass
         if self.textbox_placeholder_active:
             self.textbox_placeholder_active = False
@@ -858,13 +1065,7 @@ class EdgeTTSApp(ctk.CTk):
         if not hasattr(self, 'textbox') or not self.default_textbox_color: return
         # Verify focus is actually lost from textbox (important!)
         if self.focus_get() != self.textbox:
-            was_disabled = False
-            try:
-                was_disabled = self.textbox.cget("state") == "disabled"
-                if was_disabled:
-                    self.textbox.configure(state="normal")
-            except:
-                pass
+            was_disabled = self._textbox_writable()
             current_text = self.textbox.get("1.0", "end-1c").strip()
             if not current_text:
                 self.textbox_placeholder_active = True
@@ -872,11 +1073,7 @@ class EdgeTTSApp(ctk.CTk):
                 self.textbox.configure(text_color=TEXTBOX_PLACEHOLDER_COLOR)
                 self.after(10, self.update_char_counter)
                 self.after(20, self._update_ui_after_text_change)
-            if was_disabled:
-                try:
-                    self.textbox.configure(state="disabled")
-                except:
-                    pass
+            self._textbox_restore(was_disabled)
 
     def get_input_text(self) -> str:
         """Gets the text from the textbox, excluding the placeholder."""
@@ -892,15 +1089,10 @@ class EdgeTTSApp(ctk.CTk):
         if not hasattr(self, 'textbox') or not self.textbox.winfo_exists():
             return
         # Ensure textbox is writable even if disabled
-        was_disabled = False
-        try:
-            was_disabled = self.textbox.cget("state") == "disabled"
-            if was_disabled:
-                self.textbox.configure(state="normal")
-        except:
-            pass
+        was_disabled = self._textbox_writable()
         self.textbox.delete("1.0", ctk.END)
         self.textbox_placeholder_active = False
+        self.textbox_default_sample_active = False
         self._check_and_set_placeholder()
         self.update_char_counter()
         self._update_ui_after_text_change()
@@ -918,19 +1110,14 @@ class EdgeTTSApp(ctk.CTk):
             return
         if not clip_text:
             return
-        was_disabled = False
-        try:
-            was_disabled = self.textbox.cget("state") == "disabled"
-            if was_disabled:
-                self.textbox.configure(state="normal")
-        except:
-            pass
-        # If placeholder active, clear it first
+        was_disabled = self._textbox_writable()
+        # If placeholder/sample active, clear it first
         if self.textbox_placeholder_active:
             self.textbox.delete("1.0", ctk.END)
             self.textbox_placeholder_active = False
             if self.default_textbox_color:
                 self.textbox.configure(text_color=self.default_textbox_color)
+        self._clear_default_sample()
         self.textbox.insert(ctk.INSERT, clip_text)
         self.update_char_counter()
         self._update_ui_after_text_change()
@@ -1050,6 +1237,12 @@ class EdgeTTSApp(ctk.CTk):
 
     def set_ui_state(self, state: str):
         """Sets the enabled/disabled state of UI widgets based on application state."""
+        # Uretim surerken hicbir cagrici Generate'i yeniden acamasin:
+        # bayrak varken gorunum her zaman 'generating' kalir. Metin kutusu
+        # ve diger kontroller bu durumda ACIK tutulur (asagida), yalnizca
+        # Generate dugmesi (can_generate) kilitli kalir.
+        if getattr(self, "_generating", False):
+            state = "generating"
         is_player_ready = bool(self.just_playback_initialized and self.player)
         is_audio_loaded = bool(is_player_ready and self.audio_file_path and os.path.exists(self.audio_file_path) and self.audio_duration > 0.001)
 
@@ -1091,8 +1284,12 @@ class EdgeTTSApp(ctk.CTk):
         # (Onceki surumde helper kirmizi uyariyordu ama buton aktif kaliyordu.)
         can_generate = (has_valid_voice and has_input_text and char_count_early <= 10000
                         and state not in ['loading', 'generating', 'playing', 'error_no_audio'])
-        can_load_text = state not in ['loading', 'generating', 'playing', 'error_no_audio']
-        controls_active = state not in ['loading', 'generating', 'error_no_audio']
+        # Uretim surerken de yazmaya/ayar degistirmeye izin ver: uretim
+        # baslarken metin/ses/hiz snapshot alindigi icin ara degisiklikler
+        # suren uretimi bozmaz, sonraki uretime yansir. Kilitli kalan tek
+        # sey Generate dugmesinin kendisidir (mukerrer uretimi onler).
+        can_load_text = state not in ['loading', 'playing', 'error_no_audio']
+        controls_active = state not in ['loading', 'error_no_audio']
         # Theme switch should always be active
         theme_switch_state = ctk.NORMAL
 
@@ -1123,7 +1320,7 @@ class EdgeTTSApp(ctk.CTk):
             helper_text = "Sesler yükleniyor, lütfen bekleyin..."
             helper_color = "gray60"
         elif state == 'generating':
-            helper_text = "Ses olusturuluyor..."
+            helper_text = "Ses oluşturuluyor... yazmaya devam edebilirsiniz"
             helper_color = "#1E88E5"
         elif state == 'playing':
             helper_text = "Oynatiliyor - durdurduktan sonra yeni ses olusturabilirsiniz"
@@ -1182,6 +1379,25 @@ class EdgeTTSApp(ctk.CTk):
             if hasattr(self, 'volume_slider') and self.volume_slider.winfo_exists(): self.volume_slider.configure(state=adj_ctrl_state)
             if hasattr(self, 'rate_reset_btn') and self.rate_reset_btn.winfo_exists(): self.rate_reset_btn.configure(state=adj_ctrl_state)
             if hasattr(self, 'pitch_reset_btn') and self.pitch_reset_btn.winfo_exists(): self.pitch_reset_btn.configure(state=adj_ctrl_state)
+            if hasattr(self, 'profile_load_btns'):
+                for _b in self.profile_load_btns.values():
+                    try:
+                        if _b.winfo_exists(): _b.configure(state=voice_ctrl_state)
+                    except Exception:
+                        pass
+            if hasattr(self, 'profile_save_btns'):
+                for _b in self.profile_save_btns.values():
+                    try:
+                        if _b.winfo_exists(): _b.configure(state=voice_ctrl_state)
+                    except Exception:
+                        pass
+            if hasattr(self, 'profile_clear_btns'):
+                for _b in self.profile_clear_btns.values():
+                    try:
+                        if _b.winfo_exists(): _b.configure(state=adj_ctrl_state)
+                    except Exception:
+                        pass
+            if hasattr(self, 'profile_clear_all_btn') and self.profile_clear_all_btn.winfo_exists(): self.profile_clear_all_btn.configure(state=adj_ctrl_state)
             if hasattr(self, 'textbox') and self.textbox.winfo_exists(): self.textbox.configure(state=textbox_state)
             if hasattr(self, 'load_file_btn') and self.load_file_btn.winfo_exists(): self.load_file_btn.configure(state=load_file_btn_state)
             if hasattr(self, 'generate_btn') and self.generate_btn.winfo_exists(): self.generate_btn.configure(state=generate_btn_state, text=generate_btn_text)
@@ -1566,35 +1782,8 @@ class EdgeTTSApp(ctk.CTk):
         pending = getattr(self, '_pending_voice_shortname', None)
         if pending:
             try:
-                target_display = None
-                for disp, short in self.voices_dict.items():
-                    if short == pending:
-                        target_display = disp
-                        break
+                target_display = self._select_voice_by_shortname(pending)
                 if target_display is not None:
-                    # Filtre disi kaldiysa filtreleri gevsetmeden secilemez;
-                    # once filtreye uyan listede var mi kontrol et
-                    current_vals = list(self.voice_listbox.get(0, tk.END))
-                    if target_display not in current_vals:
-                        # Kayitli sesi gostermek icin filtreleri sifirla
-                        try:
-                            self.lang_filter_combo.set("All Languages")
-                        except Exception:
-                            pass
-                        try:
-                            self.gender_filter_combo.set("All")
-                        except Exception:
-                            pass
-                        try:
-                            self.voice_search_entry.delete(0, tk.END)
-                        except Exception:
-                            pass
-                        try:
-                            self.fav_only_checkbox.deselect()
-                        except Exception:
-                            pass
-                        self._apply_voice_filters()
-                    self._set_selected_voice(target_display)
                     try:
                         self.update_fav_button()
                         self.set_ui_state(self.check_current_audio_state())
@@ -1641,6 +1830,246 @@ class EdgeTTSApp(ctk.CTk):
             self.fav_btn.configure(text="★ Favoriden Çıkar", fg_color="#FFD700", text_color="black", hover_color="#E6C200")
         else:
             self.fav_btn.configure(text="☆ Favori Ekle", fg_color="transparent", text_color=("gray10","gray90"), hover_color=("gray80","gray20"))
+
+    # --- Ses Profilleri (ses adi + rate + pitch) ---
+    def load_voice_profiles(self):
+        """profiles.json'dan kayitli profilleri okur (yoksa bos baslar)."""
+        try:
+            data = _read_json(PROFILES_FILE, {})
+            cleaned: dict[str, dict] = {}
+            if isinstance(data, dict):
+                for key, val in data.items():
+                    try:
+                        slot = int(key)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= slot <= MAX_VOICE_PROFILES and isinstance(val, dict):
+                        try:
+                            rate = max(-100, min(100, int(val.get("rate", 0))))
+                        except (TypeError, ValueError):
+                            rate = 0
+                        try:
+                            pitch = max(-50, min(50, int(val.get("pitch", 0))))
+                        except (TypeError, ValueError):
+                            pitch = 0
+                        cleaned[str(slot)] = {
+                            "name": str(val.get("name", f"Profil {slot}"))[:30] or f"Profil {slot}",
+                            "voice": str(val.get("voice", "")),
+                            "voice_label": str(val.get("voice_label", ""))[:60],
+                            "rate": rate,
+                            "pitch": pitch,
+                        }
+            self.voice_profiles = cleaned
+            print(f"INFO: Loaded {len(cleaned)} voice profiles from {PROFILES_FILE}")
+        except Exception as e:
+            print(f"WARN: Could not load voice profiles: {e}")
+            self.voice_profiles = {}
+
+    def save_voice_profiles(self):
+        """Profillleri atomik olarak profiles.json'a yazar."""
+        if _atomic_write_json(PROFILES_FILE, self.voice_profiles):
+            print(f"INFO: Saved {len(self.voice_profiles)} voice profiles to {PROFILES_FILE}")
+        else:
+            print(f"WARN: Could not save voice profiles to {PROFILES_FILE}")
+
+    def _profile_auto_name(self, display: str, rate: int, pitch: int) -> str:
+        """Kaydetmede oneri isim: 'Emel +10% +0Hz' gibi."""
+        try:
+            first = display.split(" - ")[0].strip() if " - " in display else display.split("(")[0].strip()
+        except Exception:
+            first = display
+        return f"{first} {rate:+d}% {pitch:+d}Hz"[:30]
+
+    def _profile_short_label(self, prof: dict) -> str:
+        """Yukle dugmesinin ikinci satiri: 'Emel • +10% • +0Hz'."""
+        label = str(prof.get("voice_label", ""))
+        short = label.split(" - ")[0].strip() if " - " in label else label.split("(")[0].strip()
+        if not short:
+            short = str(prof.get("voice", ""))
+        return f"{short} • {int(prof.get('rate', 0)):+d}% • {int(prof.get('pitch', 0)):+d}Hz"
+
+    def refresh_profile_buttons(self):
+        """Profil dugmelerinin yazi/gorunumunu kayitli veriye gore tazeler."""
+        if not hasattr(self, 'profile_load_btns'):
+            return
+        for slot in range(1, MAX_VOICE_PROFILES + 1):
+            prof = self.voice_profiles.get(str(slot))
+            load_btn = self.profile_load_btns.get(slot)
+            if load_btn is None or not load_btn.winfo_exists():
+                continue
+            try:
+                if prof:
+                    load_btn.configure(text=f"{prof.get('name', f'Profil {slot}')}\n{self._profile_short_label(prof)}")
+                else:
+                    load_btn.configure(text=f"Boş Profil {slot}")
+            except Exception:
+                pass
+
+    def _current_voice_shortname(self) -> str | None:
+        """Su an secili sesin shortname'i (gecersizse None)."""
+        try:
+            display = self._get_selected_voice()
+            if not display or display in ("Loading voices...", "No match found", "No voices found"):
+                return None
+            return self.voices_dict.get(display)
+        except Exception:
+            return None
+
+    def save_profile(self, slot: int):
+        """O anki ses+rate+pitch'i slota kaydeder. Bos slota ilk kayitta isim sorar."""
+        if slot < 1 or slot > MAX_VOICE_PROFILES:
+            return
+        short = self._current_voice_shortname()
+        if not short:
+            self.update_status("⚠️ Profil için önce geçerli bir ses seçin.")
+            return
+        try:
+            rate = max(-100, min(100, int(float(self.rate_slider.get()))))
+        except Exception:
+            rate = 0
+        try:
+            pitch = max(-50, min(50, int(float(self.pitch_slider.get()))))
+        except Exception:
+            pitch = 0
+        try:
+            display = self._get_selected_voice()
+        except Exception:
+            display = short
+        key = str(slot)
+        existing = self.voice_profiles.get(key)
+        if existing:
+            name = str(existing.get("name", f"Profil {slot}"))
+        else:
+            suggested = self._profile_auto_name(display or short, rate, pitch)
+            try:
+                dlg = ctk.CTkInputDialog(text=f"Profil {slot} için isim girin:", title="Profil Kaydet")
+                answer = dlg.get_input()
+            except Exception as e:
+                print(f"WARN: Profile name dialog failed: {e}")
+                answer = None
+            if answer is None or not str(answer).strip():
+                self.update_status("Profil kaydetme iptal edildi.")
+                return
+            name = str(answer).strip()[:30]
+        self.voice_profiles[key] = {
+            "name": name,
+            "voice": short,
+            "voice_label": display or short,
+            "rate": rate,
+            "pitch": pitch,
+        }
+        self.save_voice_profiles()
+        self.refresh_profile_buttons()
+        action = "güncellendi" if existing else "kaydedildi"
+        self.update_status(f"✅ Profil {slot} {action}: {name}")
+
+    def load_profile(self, slot: int):
+        """Slottaki ses+rate+pitch'i uygular."""
+        prof = self.voice_profiles.get(str(slot))
+        if not prof:
+            self.update_status(f"Profil {slot} boş — önce 💾 ile kaydedin.")
+            return
+        try:
+            rate = max(-100, min(100, int(prof.get("rate", 0))))
+            pitch = max(-50, min(50, int(prof.get("pitch", 0))))
+        except (TypeError, ValueError):
+            rate, pitch = 0, 0
+        try:
+            if hasattr(self, 'rate_slider'):
+                self.rate_slider.set(rate)
+            self.update_rate_label(rate)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'pitch_slider'):
+                self.pitch_slider.set(pitch)
+            self.update_pitch_label(pitch)
+        except Exception:
+            pass
+        voice_ok = False
+        short = str(prof.get("voice", ""))
+        if short:
+            try:
+                found = self._select_voice_by_shortname(short)
+                voice_ok = found is not None
+            except Exception as e:
+                print(f"WARN: Could not apply profile voice: {e}")
+        try:
+            self.update_fav_button()
+            self.set_ui_state(self.check_current_audio_state())
+        except Exception:
+            pass
+        self.schedule_settings_save()
+        name = prof.get("name", f"Profil {slot}")
+        if voice_ok:
+            self.update_status(f"✅ Profil {slot} yüklendi: {name}")
+        else:
+            self.update_status(f"⚠️ Profil {slot}: hız/perde uygulandı ama '{short}' sesi bulunamadı.")
+
+    def clear_profile(self, slot: int):
+        """Slotu bosaltir ve dosyaya yazar."""
+        key = str(slot)
+        if key in self.voice_profiles:
+            name = self.voice_profiles[key].get("name", f"Profil {slot}")
+            del self.voice_profiles[key]
+            self.save_voice_profiles()
+            self.refresh_profile_buttons()
+            self.update_status(f"🗑 Profil {slot} silindi: {name}")
+        else:
+            self.update_status(f"Profil {slot} zaten boş.")
+
+    def clear_all_profiles(self):
+        """Tum profilleri sifirlar."""
+        if not self.voice_profiles:
+            self.update_status("Silinecek profil yok — hepsi boş.")
+            return
+        self.voice_profiles = {}
+        self.save_voice_profiles()
+        self.refresh_profile_buttons()
+        self.update_status("🗑 Tüm profiller temizlendi.")
+
+    def _select_voice_by_shortname(self, shortname: str) -> str | None:
+        """Shortname ile sesi bulup listede secer; filtre disindaysa
+        filtreleri sifirlayip gorunur yapar. Basarida display adi doner."""
+        if not shortname or not getattr(self, 'voices_dict', None):
+            return None
+        target_display = None
+        for disp, short in self.voices_dict.items():
+            if short == shortname:
+                target_display = disp
+                break
+        if target_display is None:
+            return None
+        try:
+            current_vals = list(self.voice_listbox.get(0, tk.END))
+        except Exception:
+            current_vals = []
+        if target_display not in current_vals:
+            try:
+                self.lang_filter_combo.set("All Languages")
+            except Exception:
+                pass
+            try:
+                self.gender_filter_combo.set("All")
+            except Exception:
+                pass
+            try:
+                self.voice_search_entry.delete(0, tk.END)
+            except Exception:
+                pass
+            try:
+                self.fav_only_checkbox.deselect()
+            except Exception:
+                pass
+            try:
+                self._apply_voice_filters()
+            except Exception:
+                pass
+        try:
+            self._set_selected_voice(target_display)
+        except Exception:
+            pass
+        return target_display
 
     def _filter_voices(self) -> list[str]:
         """Filters the list of voice display names based on search + language + gender."""
@@ -1760,6 +2189,10 @@ class EdgeTTSApp(ctk.CTk):
         rate_str = f"{rate:+d}%"
         pitch_str = f"{pitch:+d}Hz"
 
+        # Metin/ses/hiz snapshot'i thread'e tasinir; sonrasinda kullanici
+        # yazmaya devam edebilir. Bayrak, bitis yollari temizleyene kadar
+        # Generate'in yeniden acilmasini engeller.
+        self._generating = True
         self.set_ui_state('generating')
         self.update_status("Generating audio...")
         thread = threading.Thread(target=self._run_async_task,
@@ -1773,9 +2206,16 @@ class EdgeTTSApp(ctk.CTk):
             asyncio.run(coro(*args))
         except Exception as e:
             print(f"ERROR: Exception in async task thread: {e}")
-            # Update status on the main thread
-            self.after(0, lambda: self.update_status(f"❌ Error during async operation: {e}"))
-            self.after(0, lambda: self.set_ui_state('idle')) # Revert to idle state on error
+            # Update status/state on the main thread (bayragi da temizler)
+            self.after(0, self._on_generate_failed,
+                       f"❌ Error during async operation: {e}")
+
+    def _on_generate_failed(self, message: str):
+        """Uretim/yukleme hatasinda ana thread'de calisir: bayragi indirir,
+        mesaji yazar ve arayuzu idle'a alir."""
+        self._generating = False
+        self.update_status(message)
+        self.set_ui_state('idle')
 
     async def _load_voices_task(self):
         """Coroutine to fetch the list of voices from edge-tts."""
@@ -1851,6 +2291,10 @@ class EdgeTTSApp(ctk.CTk):
                     self._apply_voice_filters()
                 except Exception:
                     pass
+            try:
+                self.refresh_profile_buttons()
+            except Exception:
+                pass
             self.update_status(f"Ready. {len(voice_list)} voices loaded.")
             # Determine final state based on whether audio is already loaded
             current_state = 'generated' if self.audio_file_path else 'idle'
@@ -1896,8 +2340,8 @@ class EdgeTTSApp(ctk.CTk):
                      try: os.remove(tmp_path)
                      except OSError as rm_err: print(f"WARN: Could not remove invalid temp file {tmp_path}: {rm_err}")
                  self.audio_file_path = None
-                 self.after(0, lambda: self.update_status("❌ Error: Failed to generate valid audio file."))
-                 self.after(0, lambda: self.set_ui_state('idle'))
+                 self.after(0, self._on_generate_failed,
+                            "❌ Error: Failed to generate valid audio file.")
 
         except edge_tts.exceptions.NoAudioGeneratedError as e:
              # Specific error from edge-tts if no audio is produced (e.g., empty text)
@@ -1907,8 +2351,8 @@ class EdgeTTSApp(ctk.CTk):
                  except OSError as rm_err: print(f"WARN: Could not remove temp file {tmp_path}: {rm_err}")
              self.audio_file_path = None
              # Use get_input_text for the message check
-             self.after(0, lambda: self.update_status("❌ Error: No audio generated (is input text empty?)."))
-             self.after(0, lambda: self.set_ui_state('idle'))
+             self.after(0, self._on_generate_failed,
+                        "❌ Error: No audio generated (is input text empty?).")
         except Exception as e:
             # Catch any other exceptions during generation
             print(f"ERROR: Exception during audio generation: {e}")
@@ -1916,11 +2360,13 @@ class EdgeTTSApp(ctk.CTk):
                  try: os.remove(tmp_path)
                  except OSError as rm_err: print(f"WARN: Could not remove temp file {tmp_path}: {rm_err}")
             self.audio_file_path = None
-            self.after(0, lambda: self.update_status(f"❌ Error generating audio: {e}"))
-            self.after(0, lambda: self.set_ui_state('idle'))
+            self.after(0, self._on_generate_failed, f"❌ Error generating audio: {e}")
 
     def _on_audio_generated(self):
         """Callback on the main thread after the temporary audio file is created."""
+        # Uretim bitti (basarili yukleme veya hata): bayragi indir ki
+        # Generate yeniden acilabilsin ve gorunum kilitli kalmasin.
+        self._generating = False
         print(f"INFO: Loading generated audio file: {self.audio_file_path}")
         if not self.just_playback_initialized or not self.player:
             self.update_status("❌ Error: Audio generated, but player is not ready."); self.set_ui_state('error_no_audio'); return
@@ -1948,6 +2394,7 @@ class EdgeTTSApp(ctk.CTk):
 
     def _finish_audio_load(self):
         """Gets duration and updates UI after just_playback has loaded the file."""
+        self._generating = False # Emniyet: yukleme bitince bayrak inmis olmali
         if not self.just_playback_initialized or not self.player: return
         try:
             self.audio_duration = self.player.duration # Get duration from the player
@@ -2307,14 +2754,9 @@ class EdgeTTSApp(ctk.CTk):
 
             # Insert content into the textbox
             if hasattr(self, 'textbox') and self.textbox.winfo_exists():
-                 was_disabled = False
-                 try:
-                     was_disabled = self.textbox.cget("state") == "disabled"
-                     if was_disabled:
-                         self.textbox.configure(state="normal")
-                 except:
-                     pass
+                 was_disabled = self._textbox_writable()
                  self.textbox_placeholder_active = False # Ensure placeholder is off
+                 self.textbox_default_sample_active = False # Sample replaced by file
                  self.textbox.delete("1.0", ctk.END) # Clear old text
                  if self.default_textbox_color: # Ensure we have a valid color
                      self.textbox.configure(text_color=self.default_textbox_color) # Set normal color
@@ -2324,11 +2766,7 @@ class EdgeTTSApp(ctk.CTk):
                  self._check_and_set_placeholder()
                  self.update_char_counter()
                  self._update_ui_after_text_change()
-                 if was_disabled:
-                     try:
-                         self.textbox.configure(state="disabled")
-                     except:
-                         pass
+                 self._textbox_restore(was_disabled)
             self.update_status(status_msg) # Update status bar
             self.set_ui_state('idle') # Update button states based on new text content
 
